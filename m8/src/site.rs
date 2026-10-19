@@ -32,7 +32,10 @@ struct Traced {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 impl Trace {
@@ -42,7 +45,13 @@ impl Trace {
         let file = File::create(logs.join(format!("{session}.jsonl")))
             .map_err(|e| eprintln!("[site] no history log in {}: {e}", logs.display()))
             .ok();
-        Trace(Arc::new(Mutex::new(Traced { prompt: String::new(), entries: Vec::new(), session, logs: logs.to_path_buf(), file })))
+        Trace(Arc::new(Mutex::new(Traced {
+            prompt: String::new(),
+            entries: Vec::new(),
+            session,
+            logs: logs.to_path_buf(),
+            file,
+        })))
     }
 
     pub fn set_prompt(&self, prompt: &str) {
@@ -66,9 +75,15 @@ fn sessions(trace: &Trace) -> Value {
         .map(|dir| {
             dir.flatten()
                 .filter_map(|file| {
-                    let name = file.file_name().to_string_lossy().strip_suffix(".jsonl")?.to_string();
+                    let name = file
+                        .file_name()
+                        .to_string_lossy()
+                        .strip_suffix(".jsonl")?
+                        .to_string();
                     let size = file.metadata().map(|m| m.len()).unwrap_or(0);
-                    name.chars().all(|c| c.is_ascii_digit()).then_some((name, size))
+                    name.chars()
+                        .all(|c| c.is_ascii_digit())
+                        .then_some((name, size))
                 })
                 .collect()
         })
@@ -87,7 +102,11 @@ fn session(trace: &Trace, name: &str) -> Option<Value> {
     }
     let path = trace.0.lock().unwrap().logs.join(format!("{name}.jsonl"));
     let text = std::fs::read_to_string(path).ok()?;
-    Some(Value::Array(text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()))
+    Some(Value::Array(
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect(),
+    ))
 }
 
 /// A prompt kept in a file, so edits on the page last (the system, combat and radio prompts).
@@ -105,7 +124,10 @@ impl PromptFile {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(anyhow::anyhow!("reading {}: {e}", path.display())),
         };
-        Ok(PromptFile { path, text: Arc::new(Mutex::new(text)) })
+        Ok(PromptFile {
+            path,
+            text: Arc::new(Mutex::new(text)),
+        })
     }
 
     pub fn get(&self) -> String {
@@ -126,19 +148,35 @@ pub fn run(
     radio: PromptFile,
     link: GameLink,
     inputs: Sender<Input>,
+    event_budget: crate::brain::EventBudget,
 ) -> anyhow::Result<()> {
     let server = tiny_http::Server::http(("0.0.0.0", PORT)).map_err(|e| anyhow::anyhow!("{e}"))?;
     for mut request in server.incoming_requests() {
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
         let url = request.url().to_string();
-        let reply = match (request.method().as_str(), url.split('?').next().unwrap_or("")) {
+        let reply = match (
+            request.method().as_str(),
+            url.split('?').next().unwrap_or(""),
+        ) {
             ("GET", "/") => tiny_http::Response::from_string(include_str!("site.html"))
-                .with_header("Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>().unwrap()),
+                .with_header(
+                    "Content-Type: text/html; charset=utf-8"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                ),
             ("GET", "/history") => tiny_http::Response::from_string(include_str!("history.html"))
-                .with_header("Content-Type: text/html; charset=utf-8".parse::<tiny_http::Header>().unwrap()),
+                .with_header(
+                    "Content-Type: text/html; charset=utf-8"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                ),
             ("GET", "/trace") => {
-                let since: usize = url.split("since=").nth(1).and_then(|n| n.parse().ok()).unwrap_or(0);
+                let since: usize = url
+                    .split("since=")
+                    .nth(1)
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
                 let traced = trace.0.lock().unwrap();
                 let state = link.state.lock().unwrap().clone();
                 let new = traced.entries.get(since..).unwrap_or_default();
@@ -152,10 +190,22 @@ pub fn run(
             // (a picture the LLM saw, logs/views/<name>.png: the mate's eyes)
             ("GET", "/view") => {
                 let name = url.split("name=").nth(1).unwrap_or("");
-                let path = trace.0.lock().unwrap().logs.join("views").join(format!("{name}.png"));
-                match std::fs::read(path).ok().filter(|_| !name.is_empty() && name.chars().all(|c| c.is_ascii_digit())) {
-                    Some(png) => tiny_http::Response::from_data(png)
-                        .with_header("Content-Type: image/png".parse::<tiny_http::Header>().unwrap()),
+                let path = trace
+                    .0
+                    .lock()
+                    .unwrap()
+                    .logs
+                    .join("views")
+                    .join(format!("{name}.png"));
+                match std::fs::read(path)
+                    .ok()
+                    .filter(|_| !name.is_empty() && name.chars().all(|c| c.is_ascii_digit()))
+                {
+                    Some(png) => tiny_http::Response::from_data(png).with_header(
+                        "Content-Type: image/png"
+                            .parse::<tiny_http::Header>()
+                            .unwrap(),
+                    ),
                     None => tiny_http::Response::from_data(Vec::new()).with_status_code(404),
                 }
             }
@@ -183,7 +233,7 @@ pub fn run(
                 tiny_http::Response::from_string("")
             }
             ("POST", "/event") => {
-                let _ = inputs.send(Input::Event { text: body, react: true });
+                event_budget.send(&inputs, body, true);
                 tiny_http::Response::from_string("")
             }
             ("POST", "/save") => {

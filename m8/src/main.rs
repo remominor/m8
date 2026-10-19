@@ -57,7 +57,9 @@ impl Speaking {
 
     /// A line's voicing finished (or was dropped).
     pub fn end_line(&self) {
-        let _ = self.lines.try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        let _ = self
+            .lines
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
     }
 
     /// When his voice stops (or stopped): none while a line is still being written or voiced.
@@ -98,9 +100,11 @@ fn main() -> Result<()> {
         // Plays WAVs through the live pipeline (48 kHz, 10 ms chunks -> resample -> VAD -> STT).
         let mut cfg = cfg.clone();
         cfg.mic.save_recordings = false;
-        let mut listener = listen::Listener::new(cfg.clone(), listen::Transcriber::new(&cfg), 48000)?;
+        let mut listener =
+            listen::Listener::new(cfg.clone(), listen::Transcriber::new(&cfg), 48000)?;
         for path in &args[i + 1..] {
-            let wave = sherpa_onnx::Wave::read(path).ok_or_else(|| anyhow::anyhow!("can't read {path}"))?;
+            let wave = sherpa_onnx::Wave::read(path)
+                .ok_or_else(|| anyhow::anyhow!("can't read {path}"))?;
             let mut audio = sherpa_onnx::LinearResampler::create(wave.sample_rate(), 48000)
                 .map(|r| r.resample(wave.samples(), true))
                 .unwrap_or_else(|| wave.samples().to_vec());
@@ -117,7 +121,8 @@ fn main() -> Result<()> {
     if let Some(i) = args.iter().position(|a| a == "--transcribe") {
         let transcriber = listen::Transcriber::new(&cfg);
         for path in &args[i + 1..] {
-            let wave = sherpa_onnx::Wave::read(path).ok_or_else(|| anyhow::anyhow!("can't read {path}"))?;
+            let wave = sherpa_onnx::Wave::read(path)
+                .ok_or_else(|| anyhow::anyhow!("can't read {path}"))?;
             let samples = sherpa_onnx::LinearResampler::create(wave.sample_rate(), 16000)
                 .map(|r| r.resample(wave.samples(), true))
                 .unwrap_or_else(|| wave.samples().to_vec());
@@ -136,6 +141,8 @@ fn main() -> Result<()> {
     let link = link::GameLink::start(cfg.game.port, hello, events_tx, hearing_tx)?;
     println!("Waiting for a game on 127.0.0.1:{}", cfg.game.port);
 
+    let event_budget = brain::EventBudget::default();
+    let forwarded_events = event_budget.clone();
     let forward = inputs_tx.clone();
     std::thread::spawn(move || {
         for msg in events_rx {
@@ -145,8 +152,18 @@ fn main() -> Result<()> {
                 Some("companion_notice") => brain::Input::Notice(text("text")),
                 Some("loaded") => brain::Input::Loaded(text("id")),
                 // Console speech already carries a native snapshot of the aimed location.
-                Some("direct") => brain::Input::Heard { text: text("text"), context: msg["context_id"].as_u64() },
-                _ => brain::Input::Event { text: text("text"), react: msg["react"].as_bool().unwrap_or(true) },
+                Some("direct") => brain::Input::Heard {
+                    text: text("text"),
+                    context: msg["context_id"].as_u64(),
+                },
+                _ => {
+                    forwarded_events.send(
+                        &forward,
+                        text("text"),
+                        msg["react"].as_bool().unwrap_or(true),
+                    );
+                    continue;
+                }
             };
             let _ = forward.send(input);
         }
@@ -155,7 +172,8 @@ fn main() -> Result<()> {
     // Dialogue the game plays (the radio, cutscenes) is transcribed into the feed, on a thread
     // of its own so that the mic's isn't held up.
     {
-        let (transcriber, inputs) = (transcriber.clone(), inputs_tx.clone());
+        let (transcriber, inputs, event_budget) =
+            (transcriber.clone(), inputs_tx.clone(), event_budget.clone());
         std::thread::spawn(move || {
             for (about, samples) in hearing_rx {
                 let started = Instant::now();
@@ -173,14 +191,19 @@ fn main() -> Result<()> {
                     continue;
                 }
                 let speaker = about["speaker"].as_str().unwrap_or("Someone");
-                let over_radio = if about["radio"].as_bool().unwrap_or(false) { " over the radio" } else { "" };
+                let over_radio = if about["radio"].as_bool().unwrap_or(false) {
+                    " over the radio"
+                } else {
+                    ""
+                };
                 println!("[hearing] {speaker}{over_radio}: \"{text}\"");
                 // (the line is sent as it starts: he lets them finish before he answers)
                 std::thread::sleep(length.saturating_sub(started.elapsed()));
-                let _ = inputs.send(brain::Input::Event {
-                    text: format!("{speaker}{over_radio}: \"{text}\""),
-                    react: about["react"].as_bool().unwrap_or(true),
-                });
+                event_budget.send(
+                    &inputs,
+                    format!("{speaker}{over_radio}: \"{text}\""),
+                    about["react"].as_bool().unwrap_or(true),
+                );
             }
         });
     }
@@ -189,20 +212,33 @@ fn main() -> Result<()> {
     let persona = cfg.persona_dir();
     let system = site::PromptFile::load(persona.join("system_prompt.txt"))?;
     if system.get().trim().is_empty() {
-        anyhow::bail!("no system prompt in {} (the persona's folder: `persona` in the config)", persona.display());
+        anyhow::bail!(
+            "no system prompt in {} (the persona's folder: `persona` in the config)",
+            persona.display()
+        );
     }
     let combat = site::PromptFile::load(persona.join("combat_prompt.txt"))?;
     let radio = site::PromptFile::load(persona.join("radio_prompt.txt"))?;
     {
-        let (trace, system, combat, radio, link, inputs) =
-            (trace.clone(), system.clone(), combat.clone(), radio.clone(), link.clone(), inputs_tx.clone());
+        let (trace, system, combat, radio, link, inputs) = (
+            trace.clone(),
+            system.clone(),
+            combat.clone(),
+            radio.clone(),
+            link.clone(),
+            inputs_tx.clone(),
+        );
         std::thread::spawn(move || {
-            if let Err(e) = site::run(trace, system, combat, radio, link, inputs) {
+            if let Err(e) = site::run(trace, system, combat, radio, link, inputs, event_budget) {
                 eprintln!("[site] stopped: {e:#}");
             }
         });
     }
-    println!("Brain page: http://127.0.0.1:{} (LAN: http://<host-ip>:{}, listening on 0.0.0.0)", site::PORT, site::PORT);
+    println!(
+        "Brain page: http://127.0.0.1:{} (LAN: http://<host-ip>:{}, listening on 0.0.0.0)",
+        site::PORT,
+        site::PORT
+    );
 
     let speaking = Speaking::new();
     let (speech_tx, speech_rx) = mpsc::channel();
@@ -216,7 +252,12 @@ fn main() -> Result<()> {
     }
 
     {
-        let (cfg, heard_tx, link, speaking) = (cfg.clone(), inputs_tx.clone(), link.clone(), speaking.clone());
+        let (cfg, heard_tx, link, speaking) = (
+            cfg.clone(),
+            inputs_tx.clone(),
+            link.clone(),
+            speaking.clone(),
+        );
         std::thread::spawn(move || {
             let (tx, rx) = mpsc::channel::<String>();
             let command_link = link.clone();
@@ -228,7 +269,11 @@ fn main() -> Result<()> {
             let mut mic_error_logged = false;
             loop {
                 match listen::run(
-                    cfg.clone(), transcriber.clone(), speaking.clone(), link.clone(), tx.clone(),
+                    cfg.clone(),
+                    transcriber.clone(),
+                    speaking.clone(),
+                    link.clone(),
+                    tx.clone(),
                     || mic_error_logged = false,
                 ) {
                     Ok(()) => break,
@@ -260,6 +305,17 @@ fn main() -> Result<()> {
     });
 
     println!("Ready! Talk to {} (or type a line here).", cfg.mate.name);
-    brain::Brain::new(cfg, link, speech_tx, speaking, trace, system, combat, radio, brain_inputs).run(inputs_rx);
+    brain::Brain::new(
+        cfg,
+        link,
+        speech_tx,
+        speaking,
+        trace,
+        system,
+        combat,
+        radio,
+        brain_inputs,
+    )
+    .run(inputs_rx);
     Ok(())
 }

@@ -97,6 +97,10 @@ The checked-in `m8.toml` uses:
 | `[kev] url` / `model` | `https://llama.remominor.com/v1/systemone` / `clef-flash-artemis` |
 | `[llm] url` / `model` | `http://127.0.0.1:9292/v1/chat/completions` / `gemma4-12b-mtp-vision` |
 
+System One has an independent `[kev] timeout_ms` budget (default `5000`); failed intent
+classification sends no gameplay order and player dialogue continues. Optional event speech is
+skipped on failure. Dialogue, vision and summarization retain their separate timeout.
+
 STT, System One, and LLM URLs are complete endpoint URLs. The voice is a saved server-side
 profile (`clone:soldier` also works); do not supply a reference WAV or transcript. Delivery
 instructions come from Kevin's existing bracketed notes and persist until the next note.

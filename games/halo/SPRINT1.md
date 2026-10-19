@@ -7,9 +7,9 @@ with fire enabled; reconnecting m8 preserves the live native orders.
 ## Player commands
 
 Use the microphone, m8 console, web chat, or the game's `kevin <text>` console command.
-Clef gets one focused intent choice. A conservative phrase guard also requires the selected
-intent to match the utterance. Unsupported, conditional, quoted and compound requests leave
-orders unchanged. Common forms (with optional Kevin/Kev, please, or can you):
+Clef interprets the current utterance using one focused intent choice; it has no literal phrase
+guard. The question asks for `none` on conversation, quoted/hypothetical instructions, unsupported
+requests and ambiguous or conflicting orders. These are examples, not an approved phrase list:
 
 | Intent | Examples | Effect |
 | --- | --- | --- |
@@ -67,9 +67,11 @@ Enable optional details with `HALO_DEBUG_COMPANION=1` when launching the game, o
 native notices appear in m8 history. Navigation notices are never added to Gemma's memory or
 sent to Clef for a speech decision. Command results do enter dialogue context.
 
+Current corrective-pass results and query measurements: [Sprint 1.1](SPRINT1.1.md).
+
 ## Automated validation
 
-Local results: **376 OpenCE harness checks and 26 Rust tests passed**. The Linux release
+Sprint 1 baseline results: **376 OpenCE harness checks and 26 Rust tests passed**. The Linux release
 target and Rust release binaries built successfully. The regenerated patch applied to a clean
 pinned checkout, and all 44 resulting files matched the working sources byte for byte. Gameplay
 acceptance remains pending the checklist below. The original game executable is preserved at
@@ -96,7 +98,7 @@ They cover moving follow, search failure/backoff, partial paths, progress, slope
 occupancy, low-obstacle jump safety, teleport restrictions, targeting, friendly fire, captured
 locations, parsing, lifecycle invalidation and independent orders. Negative controls deliberately
 break safety/visibility/retry behavior and must fail. Rust tests use loopback native/model mocks;
-they cover focused classification, command guards, acknowledgements, timeouts and existing voice,
+they cover focused classification, acknowledgements, timeouts and existing voice,
 vision and memory behavior. These checks do not prove gameplay acceptance.
 
 The portable `m8.patch` includes all existing m8 additions, binary menu assets, controller

@@ -30,3 +30,5 @@ ninja linux                      # CachyOS/Linux
 
 See [Sprint 1 behavior, limitations and gameplay checklist](SPRINT1.md) for command examples,
 diagnostics, automated validation and the pending Pillar of Autumn checks.
+
+Sprint 1.1 corrections, query measurements and validation notes: [SPRINT1.1.md](SPRINT1.1.md).

@@ -32,7 +32,9 @@ pub fn mark(rgb: &mut [u8], width: usize, height: usize, spots: &[Value]) {
         }
     };
     for spot in spots {
-        let (Some(id), Some(x), Some(y)) = (spot["id"].as_u64(), spot["x"].as_f64(), spot["y"].as_f64()) else {
+        let (Some(id), Some(x), Some(y)) =
+            (spot["id"].as_u64(), spot["x"].as_f64(), spot["y"].as_f64())
+        else {
             continue;
         };
         let (cx, cy) = ((x * width as f64) as i64, (y * height as f64) as i64);
@@ -120,7 +122,11 @@ fn crc32(bytes: &[u8]) -> u32 {
     for &byte in bytes {
         crc ^= byte as u32;
         for _ in 0..8 {
-            crc = if crc & 1 == 1 { 0xEDB8_8320 ^ (crc >> 1) } else { crc >> 1 };
+            crc = if crc & 1 == 1 {
+                0xEDB8_8320 ^ (crc >> 1)
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -130,9 +136,15 @@ pub fn base64(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for group in bytes.chunks(3) {
-        let n = (group[0] as u32) << 16 | (*group.get(1).unwrap_or(&0) as u32) << 8 | *group.get(2).unwrap_or(&0) as u32;
+        let n = (group[0] as u32) << 16
+            | (*group.get(1).unwrap_or(&0) as u32) << 8
+            | *group.get(2).unwrap_or(&0) as u32;
         for i in 0..4 {
-            out.push(if i <= group.len() { TABLE[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+            out.push(if i <= group.len() {
+                TABLE[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
         }
     }
     out

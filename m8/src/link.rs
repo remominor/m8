@@ -7,11 +7,11 @@
 //! the mate asked for (`view`): `[u16 big-endian length][JSON: width, height, spots][RGB rows]`.
 
 use serde_json::{json, Value};
-use std::io::{BufReader, Read, Write};
 use std::collections::HashMap;
+use std::io::{BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::{self, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
@@ -78,7 +78,12 @@ impl GameLink {
 
     /// Starts accepting connections in the background. The game's events, saves and loads go to
     /// `events`, dialogue it played to `hearing`.
-    pub fn start(port: u16, hello: Value, events: Sender<Value>, hearing: Sender<Heard>) -> anyhow::Result<Self> {
+    pub fn start(
+        port: u16,
+        hello: Value,
+        events: Sender<Value>,
+        hearing: Sender<Heard>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", port))?;
         let link = GameLink {
             writer: Arc::new(Mutex::new(None)),
@@ -95,7 +100,9 @@ impl GameLink {
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let _ = stream.set_nodelay(true);
-                let Ok(reader) = stream.try_clone() else { continue };
+                let Ok(reader) = stream.try_clone() else {
+                    continue;
+                };
                 println!("[game] game connected");
                 accept_link.pending.lock().unwrap().clear();
                 *accept_link.state.lock().unwrap() = Value::Null;
@@ -120,7 +127,9 @@ impl GameLink {
         let mut view = slot.lock().unwrap();
         *view = None;
         self.send_json(&json!({"type": "view"}));
-        let (mut view, _) = came.wait_timeout_while(view, wait, |view| view.is_none()).unwrap();
+        let (mut view, _) = came
+            .wait_timeout_while(view, wait, |view| view.is_none())
+            .unwrap();
         view.take()
     }
 
@@ -145,8 +154,12 @@ impl GameLink {
     }
 
     pub fn capture_command(&self) -> Option<u64> {
-        self.request(json!({"type": "capture_command"}), Duration::from_millis(500))?
-            ["context_id"].as_u64().filter(|id| *id > 0 && *id <= 0x7fff_ffff)
+        self.request(
+            json!({"type": "capture_command"}),
+            Duration::from_millis(500),
+        )?["context_id"]
+            .as_u64()
+            .filter(|id| *id > 0 && *id <= 0x7fff_ffff)
     }
 
     pub fn send_audio(&self, pcm: &[u8]) {
@@ -184,7 +197,10 @@ impl GameLink {
             }
             if header[0] == KIND_HEAR && payload.len() >= 2 {
                 let length = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-                let Some(about) = payload.get(2..2 + length).and_then(|j| serde_json::from_slice::<Value>(j).ok()) else {
+                let Some(about) = payload
+                    .get(2..2 + length)
+                    .and_then(|j| serde_json::from_slice::<Value>(j).ok())
+                else {
                     continue;
                 };
                 let samples = payload[2 + length..]
@@ -196,15 +212,26 @@ impl GameLink {
             }
             if header[0] == KIND_VIEW && payload.len() >= 2 {
                 let length = u16::from_be_bytes([payload[0], payload[1]]) as usize;
-                let Some(about) = payload.get(2..2 + length).and_then(|j| serde_json::from_slice::<Value>(j).ok()) else {
+                let Some(about) = payload
+                    .get(2..2 + length)
+                    .and_then(|j| serde_json::from_slice::<Value>(j).ok())
+                else {
                     continue;
                 };
-                let (width, height) = (about["width"].as_u64().unwrap_or(0) as usize, about["height"].as_u64().unwrap_or(0) as usize);
+                let (width, height) = (
+                    about["width"].as_u64().unwrap_or(0) as usize,
+                    about["height"].as_u64().unwrap_or(0) as usize,
+                );
                 let rgb = payload[2 + length..].to_vec();
                 if width * height * 3 == rgb.len() {
                     let spots = about["spots"].as_array().cloned().unwrap_or_default();
                     let (slot, came) = &*self.view;
-                    *slot.lock().unwrap() = Some(View { width, height, rgb, spots });
+                    *slot.lock().unwrap() = Some(View {
+                        width,
+                        height,
+                        rgb,
+                        spots,
+                    });
                     came.notify_all();
                 }
                 continue;
@@ -212,7 +239,9 @@ impl GameLink {
             if header[0] != KIND_JSON {
                 continue;
             }
-            let Ok(msg) = serde_json::from_slice::<Value>(&payload) else { continue };
+            let Ok(msg) = serde_json::from_slice::<Value>(&payload) else {
+                continue;
+            };
             match msg["type"].as_str() {
                 Some("command_context" | "command_result") => {
                     if let Some(id) = msg["request_id"].as_u64() {
@@ -224,14 +253,22 @@ impl GameLink {
                 Some("state") => *self.state.lock().unwrap() = msg,
                 Some("settings") => {
                     if let Some(seconds) = msg["speech_cooldown"].as_f64() {
-                        self.speech_cooldown_ms.store((seconds.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
+                        self.speech_cooldown_ms
+                            .store((seconds.max(0.0) * 1000.0) as u64, Ordering::Relaxed);
                         println!("[game] speech cooldown {seconds} s");
                     }
                 }
                 Some("mic") => {
                     let muted = msg["muted"].as_bool().unwrap_or(false);
                     if self.mic_muted.swap(muted, Ordering::Relaxed) != muted {
-                        println!("[mic] {}", if muted { "muted in the game" } else { "unmuted in the game" });
+                        println!(
+                            "[mic] {}",
+                            if muted {
+                                "muted in the game"
+                            } else {
+                                "unmuted in the game"
+                            }
+                        );
                     }
                 }
                 Some("event" | "saved" | "loaded" | "direct" | "companion_notice") => {
@@ -251,7 +288,8 @@ mod tests {
     fn native_reply(peer: &mut TcpStream, reply: Value) {
         let payload = reply.to_string();
         peer.write_all(&[KIND_JSON]).unwrap();
-        peer.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(&(payload.len() as u32).to_be_bytes())
+            .unwrap();
         peer.write_all(payload.as_bytes()).unwrap();
     }
 
@@ -261,10 +299,16 @@ mod tests {
         let native = std::thread::spawn(move || {
             let request: Value = serde_json::from_slice(&frame(&mut peer).1).unwrap();
             assert_eq!(request["type"], "capture_command");
-            native_reply(&mut peer, json!({"type":"command_context", "request_id":999999,
-                "context_id":99})); // An unrelated reply cannot select the aim snapshot.
-            native_reply(&mut peer, json!({"type":"command_context", "request_id":request["request_id"],
-                "context_id":17,"aim_valid":true}));
+            native_reply(
+                &mut peer,
+                json!({"type":"command_context", "request_id":999999,
+                "context_id":99}),
+            ); // An unrelated reply cannot select the aim snapshot.
+            native_reply(
+                &mut peer,
+                json!({"type":"command_context", "request_id":request["request_id"],
+                "context_id":17,"aim_valid":true}),
+            );
         });
         match crate::brain::Input::heard("Go there".into(), &link) {
             crate::brain::Input::Heard { text, context } => {
@@ -280,13 +324,16 @@ mod tests {
     #[test]
     fn missing_native_ack_times_out_without_replaying_the_command() {
         let (link, mut peer) = GameLink::test_pair();
-        let result = link.request(json!({"type":"action","action":"stay","context_id":17}),
-            Duration::from_millis(25));
+        let result = link.request(
+            json!({"type":"action","action":"stay","context_id":17}),
+            Duration::from_millis(25),
+        );
         assert!(result.is_none());
         assert!(link.pending.lock().unwrap().is_empty());
         let request: Value = serde_json::from_slice(&frame(&mut peer).1).unwrap();
         assert_eq!(request["action"], "stay");
-        peer.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(25)))
+            .unwrap();
         assert!(peer.read(&mut [0; 1]).is_err());
     }
 }

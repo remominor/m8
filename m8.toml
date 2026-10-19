@@ -34,6 +34,8 @@ model = "parakeet"
 # Clef System One via Unraid llama-swap: complete URL.
 url = "https://llama.remominor.com/v1/systemone"
 model = "clef-flash-artemis"
+# Total System One request budget; dialogue and vision keep their own timeout.
+timeout_ms = 5000
 
 [llm]
 # Gemma dialogue and vision via local llama-swap: complete URL.

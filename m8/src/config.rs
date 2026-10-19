@@ -63,6 +63,9 @@ pub struct SttConfig {
 #[derive(Deserialize, Clone)]
 pub struct KevConfig {
     pub url: String,
+    /// Total System One request budget, independent of dialogue and vision.
+    #[serde(default = "default_kev_timeout")]
+    pub timeout_ms: u64,
     #[serde(default = "default_kev_model")]
     pub model: String,
 }
@@ -92,8 +95,15 @@ impl Config {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config {}", path.display()))?;
         let mut cfg: Config = toml::from_str(&text).context("parsing config")?;
+        anyhow::ensure!(
+            cfg.kev.timeout_ms > 0,
+            "kev.timeout_ms must be greater than zero"
+        );
         // Model routing uses exact IDs; accidental whitespace must not become part of one.
-        for model in [&mut cfg.llm.model, &mut cfg.kev.model].into_iter().chain(cfg.stt.model.iter_mut()) {
+        for model in [&mut cfg.llm.model, &mut cfg.kev.model]
+            .into_iter()
+            .chain(cfg.stt.model.iter_mut())
+        {
             *model = model.trim().to_string();
         }
         let base = path.parent().unwrap_or(Path::new("."));
@@ -133,6 +143,9 @@ fn default_guidance() -> f32 {
 fn default_seed() -> u64 {
     42
 }
+fn default_kev_timeout() -> u64 {
+    5000
+}
 fn default_kev_model() -> String {
     "clef-flash-artemis".into()
 }
@@ -149,6 +162,33 @@ pub fn path_str(p: &Path) -> String {
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
+
+    #[test]
+    fn system_one_timeout_defaults_is_configurable_and_rejects_zero() {
+        let mut document: toml::Value = toml::from_str(crate::test_support::CONFIG).unwrap();
+        assert_eq!(
+            toml::from_str::<Config>(crate::test_support::CONFIG)
+                .unwrap()
+                .kev
+                .timeout_ms,
+            5000
+        );
+        document["kev"]
+            .as_table_mut()
+            .unwrap()
+            .insert("timeout_ms".into(), toml::Value::Integer(250));
+        let dir = TestDir::new();
+        let path = dir.0.join("m8.toml");
+        std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+        assert_eq!(Config::load(&path).unwrap().kev.timeout_ms, 250);
+        document["kev"]["timeout_ms"] = toml::Value::Integer(0);
+        std::fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+        assert!(Config::load(&path)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("timeout_ms"));
+    }
 
     #[test]
     fn model_routing_ids_ignore_surrounding_whitespace() {

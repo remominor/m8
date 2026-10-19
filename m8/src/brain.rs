@@ -23,29 +23,83 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant};
 
 pub enum Input {
+    #[cfg(test)]
+    Stop,
     /// Something the player said (mic, console or the site).
-    Heard { text: String, context: Option<u64> },
-    /// Something that happened in the game, in words. `react`: Kev picks what the mate does
-    /// about it (and whether it speaks); without, it only goes into the feed (e.g. dialogue in a
-    /// cutscene).
-    Event { text: String, react: bool },
+    Heard {
+        text: String,
+        context: Option<u64>,
+    },
+    /// Something that happened in the game. `react` asks Clef whether to speak;
+    /// otherwise it only goes into the feed (e.g. dialogue in a cutscene).
+    Event {
+        text: String,
+        react: bool,
+        permit: Option<EventPermit>,
+    },
     /// The game saved (its id for the save), or loaded a save.
     Saved(String),
     /// Native diagnostics for history only; never conversational telemetry.
     Notice(String),
     Loaded(String),
     /// A summary of the feed's oldest lines is ready.
-    Summary { memory: u64, folded: usize, text: String },
+    Summary {
+        memory: u64,
+        folded: usize,
+        text: String,
+    },
+}
+
+/// Bound only low-priority events; player and lifecycle inputs keep the FIFO channel.
+#[derive(Clone, Default)]
+pub struct EventBudget(Arc<EventCounts>);
+#[derive(Default)]
+struct EventCounts {
+    pending: AtomicUsize,
+    dropped: AtomicUsize,
+}
+pub struct EventPermit(Arc<EventCounts>);
+impl Drop for EventPermit {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+impl EventBudget {
+    pub fn send(&self, inputs: &Sender<Input>, text: String, react: bool) {
+        if self
+            .0
+            .pending
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                (pending < 64).then_some(pending + 1)
+            })
+            .is_err()
+        {
+            self.0.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let _ = inputs.send(Input::Event {
+            text,
+            react,
+            permit: Some(EventPermit(self.0.clone())),
+        });
+    }
 }
 
 impl Input {
     /// Capture before queueing: slow dialogue/classification must not move the
     /// destination to whatever Chief happens to aim at later.
     pub fn heard(text: String, link: &GameLink) -> Self {
-        Self::Heard { text, context: link.capture_command() }
+        Self::Heard {
+            text,
+            context: link.capture_command(),
+        }
     }
 }
 
@@ -78,6 +132,7 @@ pub struct Brain {
     speech: Sender<SpeechJob>,
     speaking: Speaking,
     agent: ureq::Agent,
+    kev_agent: ureq::Agent,
     trace: Trace,
     system: PromptFile,
     combat: PromptFile,
@@ -103,7 +158,13 @@ impl Brain {
         radio: PromptFile,
         inputs: Sender<Input>,
     ) -> Self {
-        let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(60)).build();
+        let agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_secs(60))
+            .build();
+        let kev_agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(cfg.kev.timeout_ms))
+            .timeout_connect(Duration::from_millis(cfg.kev.timeout_ms.min(1000)))
+            .build();
         let saves = std::fs::read_to_string(Self::saves_path(&cfg))
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
@@ -114,6 +175,7 @@ impl Brain {
             speech,
             speaking,
             agent,
+            kev_agent,
             trace,
             system,
             combat,
@@ -140,14 +202,21 @@ impl Brain {
                     Err(RecvTimeoutError::Disconnected) => break,
                     Err(RecvTimeoutError::Timeout) => {
                         let s = self.state();
-                        if self.speaking.is_speaking() || s.is_null() || s["in_combat"].as_bool().unwrap_or(false) {
+                        if self.speaking.is_speaking()
+                            || s.is_null()
+                            || s["in_combat"].as_bool().unwrap_or(false)
+                        {
                             quiet_since = Instant::now();
                         }
                         if quiet_since.elapsed() < QUIET {
                             continue;
                         }
                         quiet = true;
-                        Input::Event { text: QUIET_EVENT.to_string(), react: true }
+                        Input::Event {
+                            text: QUIET_EVENT.to_string(),
+                            react: true,
+                            permit: None,
+                        }
                     }
                 },
             };
@@ -156,18 +225,38 @@ impl Brain {
                 quiet_since = Instant::now();
             }
             let result = match input {
+                #[cfg(test)]
+                Input::Stop => break,
                 Input::Heard { text, context } => self.on_heard(&text, context),
-                Input::Event { text, react } => {
+                Input::Event {
+                    text,
+                    react,
+                    permit,
+                } => {
                     // (and the events that came in meanwhile, all at once: he reacts to what's
                     // happened since, not to each in turn, falling behind)
+                    let mut permits: Vec<_> = permit.into_iter().collect();
                     let mut events = vec![(text, react)];
                     while let Ok(more) = inputs.try_recv() {
                         match more {
-                            Input::Event { text, react } => events.push((text, react)),
+                            Input::Event {
+                                text,
+                                react,
+                                permit,
+                            } => {
+                                permits.extend(permit);
+                                events.push((text, react));
+                            }
                             other => {
                                 waiting = Some(other);
                                 break;
                             }
+                        }
+                    }
+                    if let Some(permit) = permits.first() {
+                        let dropped = permit.0.dropped.swap(0, Ordering::Relaxed);
+                        if dropped > 0 {
+                            self.trace.add("input", json!({"events_dropped": dropped}));
                         }
                     }
                     self.on_events(&events)
@@ -178,7 +267,11 @@ impl Brain {
                     Ok(())
                 }
                 Input::Loaded(id) => self.on_loaded(&id),
-                Input::Summary { memory, folded, text } => self.on_summary(memory, folded, text),
+                Input::Summary {
+                    memory,
+                    folded,
+                    text,
+                } => self.on_summary(memory, folded, text),
             };
             if let Err(e) = result {
                 eprintln!("[brain] error: {e:#}");
@@ -194,8 +287,13 @@ impl Brain {
         self.trace.add("heard", json!({"text": text}));
         // A command failure must not take down the ordinary conversation.
         if let Err(error) = self.interpret_command(text, context) {
-            self.trace.add("command", json!({"text": text, "error": format!("{error:#}")}));
-            self.memory.feed.push("(Command interpretation failed; no player order was sent.)".into());
+            self.trace.add(
+                "command",
+                json!({"text": text, "error": format!("{error:#}")}),
+            );
+            self.memory
+                .feed
+                .push("(Command interpretation failed; no player order was sent.)".into());
         }
         self.respond(true)
     }
@@ -205,7 +303,10 @@ impl Brain {
             let text = self.fill(text);
             self.memory.feed.push(text.clone());
             // (and the game's state as it was then: what Kev and the LLM saw of it)
-            self.trace.add("event", json!({"text": text, "react": react, "state": self.state()}));
+            self.trace.add(
+                "event",
+                json!({"text": text, "react": react, "state": self.state()}),
+            );
         }
         if events.iter().any(|(_, react)| *react) {
             self.respond(false)?;
@@ -217,7 +318,9 @@ impl Brain {
     /// relevance decision and the existing voice cooldown/interruption path.
     fn respond(&mut self, to_player: bool) -> Result<()> {
         let cooldown = !to_player
-            && self.speaking.quiet_from().map_or(true, |quiet| Instant::now() < quiet + self.link.speech_cooldown());
+            && self.speaking.quiet_from().map_or(true, |quiet| {
+                Instant::now() < quiet + self.link.speech_cooldown()
+            });
         if self.decide(to_player, cooldown)? {
             // (still talking: he drops what he hadn't said yet; what's playing goes on until the
             // new line's first audio takes its place, speak.rs)
@@ -239,8 +342,12 @@ impl Brain {
         if self.saves.len() > SAVES {
             self.saves.remove(0);
         }
-        std::fs::write(Self::saves_path(&self.cfg), serde_json::to_string(&self.saves)?)?;
-        self.trace.add("event", json!({"text": format!("(the game saved: {id})")}));
+        std::fs::write(
+            Self::saves_path(&self.cfg),
+            serde_json::to_string(&self.saves)?,
+        )?;
+        self.trace
+            .add("event", json!({"text": format!("(the game saved: {id})")}));
         // (a safe point to fold the feed)
         self.fold_over(FEED_TOKENS);
         Ok(())
@@ -256,8 +363,15 @@ impl Brain {
             self.speaking.interrupt();
             self.link.send_json(&json!({"type": "stop_audio"}));
         }
-        let note = if found.is_some() { "memory restored" } else { "a save it never saw: memory cleared" };
-        self.trace.add("event", json!({"text": format!("(the game loaded {id}: {note})")}));
+        let note = if found.is_some() {
+            "memory restored"
+        } else {
+            "a save it never saw: memory cleared"
+        };
+        self.trace.add(
+            "event",
+            json!({"text": format!("(the game loaded {id}: {note})")}),
+        );
         println!("[brain] loaded {id}: {note}");
         Ok(())
     }
@@ -267,7 +381,10 @@ impl Brain {
         if memory == self.memory_generation && folded <= self.memory.feed.len() {
             self.memory.feed.drain(..folded);
             self.memory.summary = text;
-            self.trace.add("memory", json!({"summary": self.memory.summary, "folded": folded}));
+            self.trace.add(
+                "memory",
+                json!({"summary": self.memory.summary, "folded": folded}),
+            );
         }
         Ok(())
     }
@@ -280,14 +397,27 @@ impl Brain {
             return;
         }
         let mut folded = 0;
-        while folded < self.memory.feed.len() && tokens(&self.memory.feed[folded..]) > FEED_FOLDED_TO {
+        while folded < self.memory.feed.len()
+            && tokens(&self.memory.feed[folded..]) > FEED_FOLDED_TO
+        {
             folded += 1;
         }
         self.summarizing = true;
-        let (agent, url, name) = (self.agent.clone(), self.cfg.llm.url.clone(), self.cfg.mate.name.clone());
+        let (agent, url, name) = (
+            self.agent.clone(),
+            self.cfg.llm.url.clone(),
+            self.cfg.mate.name.clone(),
+        );
         let model = self.cfg.llm.model.clone();
-        let (previous, lines) = (self.memory.summary.clone(), self.memory.feed[..folded].join("\n"));
-        let (inputs, memory, trace) = (self.inputs.clone(), self.memory_generation, self.trace.clone());
+        let (previous, lines) = (
+            self.memory.summary.clone(),
+            self.memory.feed[..folded].join("\n"),
+        );
+        let (inputs, memory, trace) = (
+            self.inputs.clone(),
+            self.memory_generation,
+            self.trace.clone(),
+        );
         let temperature = 0.3;
         std::thread::spawn(move || {
             let start = Instant::now();
@@ -300,10 +430,16 @@ impl Brain {
             let messages = json!([{"role": "user", "content": request}]);
             let reply: Result<Value> = agent
                 .post(&url)
-                .send_json(json!({"model": model, "messages": messages, "temperature": temperature}))
+                .send_json(
+                    json!({"model": model, "messages": messages, "temperature": temperature}),
+                )
                 .map_err(anyhow::Error::from)
                 .and_then(|r| Ok(r.into_json()?));
-            let output = reply.as_ref().ok().and_then(|r| r["choices"][0]["message"]["content"].as_str()).map(str::to_string);
+            let output = reply
+                .as_ref()
+                .ok()
+                .and_then(|r| r["choices"][0]["message"]["content"].as_str())
+                .map(str::to_string);
             trace.add(
                 "summary",
                 json!({
@@ -317,9 +453,16 @@ impl Brain {
             );
             match output {
                 Some(output) => {
-                    let _ = inputs.send(Input::Summary { memory, folded, text: clean(&output) });
+                    let _ = inputs.send(Input::Summary {
+                        memory,
+                        folded,
+                        text: clean(&output),
+                    });
                 }
-                None => eprintln!("[brain] summary failed: {:#}", reply.err().map(|e| e.to_string()).unwrap_or_default()),
+                None => eprintln!(
+                    "[brain] summary failed: {:#}",
+                    reply.err().map(|e| e.to_string()).unwrap_or_default()
+                ),
             }
         });
     }
@@ -341,7 +484,8 @@ impl Brain {
     /// The game's text (and the prompts) with the player's name and the game's in place of
     /// {player} and {game}.
     fn fill(&self, text: &str) -> String {
-        text.replace("{player}", &self.player()).replace("{game}", self.state()["game"].as_str().unwrap_or("a game"))
+        text.replace("{player}", &self.player())
+            .replace("{game}", self.state()["game"].as_str().unwrap_or("a game"))
     }
 
     /// The level's story so far, as the player knows it (levels/<level>.txt), and what the mate
@@ -349,18 +493,30 @@ impl Brain {
     fn context(&self) -> Vec<String> {
         let mut parts = Vec::new();
         if let Some(story) = self.state()["level"].as_str().and_then(|level| {
-            std::fs::read_to_string(self.cfg.persona_dir().join("levels").join(format!("{level}.txt"))).ok()
+            std::fs::read_to_string(
+                self.cfg
+                    .persona_dir()
+                    .join("levels")
+                    .join(format!("{level}.txt")),
+            )
+            .ok()
         }) {
             parts.push(self.fill(story.trim()));
         }
         if !self.memory.summary.is_empty() {
-            parts.push(format!("What {} remembers: {}", self.cfg.mate.name, self.memory.summary));
+            parts.push(format!(
+                "What {} remembers: {}",
+                self.cfg.mate.name, self.memory.summary
+            ));
         }
         parts
     }
 
     fn right_now(&self) -> String {
-        format!("Right now: {}", self.fill(self.state()["state"].as_str().unwrap_or("unknown")))
+        format!(
+            "Right now: {}",
+            self.fill(self.state()["state"].as_str().unwrap_or("unknown"))
+        )
     }
 
     /// Who the mate is: the system prompt.
@@ -388,7 +544,11 @@ impl Brain {
     /// player's since).
     fn newest(&self) -> usize {
         let own = format!("{}: ", self.cfg.mate.name);
-        self.memory.feed.iter().rposition(|line| line.starts_with(&own)).map_or(0, |at| at + 1)
+        self.memory
+            .feed
+            .iter()
+            .rposition(|line| line.starts_with(&own))
+            .map_or(0, |at| at + 1)
     }
 
     /// Kev's prompt: who the mate is, the context, the feed's newest KEV_FEED_LINES, with what
@@ -440,9 +600,16 @@ impl Brain {
         for line in &self.memory.feed[newest..] {
             add("user", line);
         }
-        let messages: Vec<Value> = turns.iter().map(|(role, text)| json!({"role": role, "content": text})).collect();
+        let messages: Vec<Value> = turns
+            .iter()
+            .map(|(role, text)| json!({"role": role, "content": text}))
+            .collect();
         self.trace.set_prompt(
-            &turns.iter().map(|(role, text)| format!("[{role}]\n{text}")).collect::<Vec<_>>().join("\n\n"),
+            &turns
+                .iter()
+                .map(|(role, text)| format!("[{role}]\n{text}"))
+                .collect::<Vec<_>>()
+                .join("\n\n"),
         );
         messages
     }
@@ -454,32 +621,34 @@ impl Brain {
         let mut calls = Vec::new();
         let question = json!({"intent": {
             "type": "choice",
-            "instructions": "Interpret ONLY the player's current utterance. Execute only an explicit, unambiguous instruction addressed to Kevin. Choose none for ordinary conversation, descriptions, jokes, quotations, negated or hypothetical commands, vague requests, unsupported actions, multiple conflicting orders, or unclear destinations. A location command must clearly mean the ground Chief was aiming at when speaking. Never infer an order from game events or prior dialogue.",
+            "instructions": "Interpret ONLY the player's current utterance. Identify a genuine, unambiguous instruction to change Kevin's gameplay behavior, including natural indirect requests. Questions asking Kevin to do something can be instructions; questions about what he is doing are conversation. Choose none for ordinary conversation, descriptions, jokes, quoted or hypothetical instructions, unsupported requests, ambiguous or conflicting instructions, or unclear destinations. Negative instructions such as do not shoot can mean hold_fire; never invert a negated movement request into a positive order. A location command must clearly mean the ground Chief was aiming at when speaking. Never infer an order from game events or prior dialogue.",
             "criteria": {
                 "none": "No clear supported instruction; preserve every current order.",
-                "follow": "Explicitly tells Kevin to follow Chief.",
-                "stay": "Explicitly tells Kevin to stay or hold his current position.",
+                "follow": "Asks Kevin to accompany, return to, or follow Chief.",
+                "stay": "Asks Kevin to wait, stay or hold his current position.",
                 "go_aim": "Explicitly tells Kevin to move to the ground Chief is pointing or aiming at, such as go there.",
                 "hold_fire": "Explicitly tells Kevin to stop shooting or hold fire.",
                 "resume_fire": "Explicitly tells Kevin to resume shooting or fire at will."
             }
         }});
         let prompt = format!("Current player utterance: {}", serde_json::to_string(text)?);
-        let answer = self.kev("intent", &prompt, &question, &mut calls)?;
+        let answer = self.kev("intent", &prompt, &question, &mut calls);
+        if let Err(error) = &answer {
+            self.trace.add("kev", json!({"calls": calls, "action": "none", "sent": false,
+                "purpose": "intent", "error": format!("{error:#}"), "ms": started.elapsed().as_millis() as u64}));
+        }
+        let answer = answer?;
         let intent = command_intent(&answer);
         self.trace.add("kev", json!({"calls": calls, "action": intent, "sent": false, "purpose": "intent", "ms": started.elapsed().as_millis() as u64}));
         if intent == "none" {
             return Ok(());
         }
-        if !explicit_command(text, intent, &self.cfg.mate.name) {
-            self.trace.add("command", json!({"intent": intent, "sent": false, "text": "Unclear or unsupported command wording; orders unchanged."}));
-            self.memory.feed.push("(No gameplay order was sent: the wording did not clearly match a supported command.)".into());
-            return Ok(());
-        }
-        let result = context.and_then(|id| self.link.request(
-            json!({"type": "action", "action": intent, "context_id": id}),
-            Duration::from_secs(1),
-        ));
+        let result = context.and_then(|id| {
+            self.link.request(
+                json!({"type": "action", "action": intent, "context_id": id}),
+                Duration::from_secs(1),
+            )
+        });
         let outcome = match result.as_ref() {
             Some(reply) if reply["accepted"].as_bool() == Some(true) => format!(
                 "Kevin is now {}, with autonomous fire {}.",
@@ -496,7 +665,10 @@ impl Brain {
             None if context.is_none() => "No order was sent because the game was unavailable when you spoke; please repeat the order.".into(),
             None => "The order was sent but the game has not confirmed it; do not claim it succeeded.".into(),
         };
-        self.trace.add("command", json!({"intent": intent, "context_id": context, "result": result, "text": outcome}));
+        self.trace.add(
+            "command",
+            json!({"intent": intent, "context_id": context, "result": result, "text": outcome}),
+        );
         self.memory.feed.push(format!("({outcome})"));
         Ok(())
     }
@@ -510,13 +682,24 @@ impl Brain {
         let start = Instant::now();
         let mut calls = Vec::new();
         let ask_speak = !to_player && !cooldown;
-        let speak = to_player || ask_speak && {
-            let question = json!({"speak": {"type": "noul", "instructions": format!("Should {} speak now?", self.cfg.mate.name)}});
-            self.kev("speak", &self.prompt(), &question, &mut calls)?["speak"]["noul"].as_f64().unwrap_or(0.0) >= 0.5
-        };
-        self.trace.add("kev", json!({"calls": calls, "action": "none", "sent": false,
+        let speak = to_player
+            || ask_speak
+                && {
+                    let question = json!({"speak": {"type": "noul", "instructions": format!("Should {} speak now?", self.cfg.mate.name)}});
+                    match self.kev("speak", &self.prompt(), &question, &mut calls) {
+                        Ok(answer) => answer["speak"]["noul"].as_f64().unwrap_or(0.0) >= 0.5,
+                        Err(error) => {
+                            eprintln!("[brain] optional speech decision failed: {error:#}");
+                            false
+                        }
+                    }
+                };
+        self.trace.add(
+            "kev",
+            json!({"calls": calls, "action": "none", "sent": false,
             "speak": speak, "speak_asked": ask_speak, "cooldown": cooldown,
-            "ms": start.elapsed().as_millis() as u64}));
+            "ms": start.elapsed().as_millis() as u64}),
+        );
         Ok(speak)
     }
 
@@ -527,28 +710,52 @@ impl Brain {
     fn act(&mut self, purpose: &str, actions: &[Value], calls: &mut Vec<Value>) -> Result<Value> {
         let name = self.cfg.mate.name.clone();
         let mut options = serde_json::Map::new();
-        options.insert("nothing".to_string(), json!(format!("{name} carries on as he is")));
+        options.insert(
+            "nothing".to_string(),
+            json!(format!("{name} carries on as he is")),
+        );
         for a in actions {
             let description = self.fill(a["description"].as_str().unwrap_or_default());
-            options.insert(a["name"].as_str().unwrap_or_default().to_string(), json!(format!("{name} {description}")));
+            options.insert(
+                a["name"].as_str().unwrap_or_default().to_string(),
+                json!(format!("{name} {description}")),
+            );
         }
         let prompt = self.prompt();
         let question = json!({"do": {"type": "choice", "instructions": format!("Which of these does {name} do now?"), "criteria": options}});
         let answers = self.kev(purpose, &prompt, &question, calls)?;
-        let action = answers["do"]["choice"].as_str().unwrap_or("nothing").to_string();
+        let action = answers["do"]["choice"]
+            .as_str()
+            .unwrap_or("nothing")
+            .to_string();
         if action == "nothing" {
             return Ok(json!({"action": action}));
         }
-        let chosen = actions.iter().find(|a| a["name"] == action.as_str()).cloned().unwrap_or_default();
+        let chosen = actions
+            .iter()
+            .find(|a| a["name"] == action.as_str())
+            .cloned()
+            .unwrap_or_default();
         let mut msg = json!({"type": "action", "action": action});
         // ("Kevin stands up." / "Kevin shoots at an enemy: grunt close (8 m) ahead.")
-        let mut line = options[action.as_str()].as_str().unwrap_or_default().to_string();
+        let mut line = options[action.as_str()]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         if let Some(targets) = chosen["options"].as_object().filter(|o| !o.is_empty()) {
             let which = json!({"which": {"type": "choice", "instructions": format!("{line}. Which one?"), "criteria": targets}});
-            let which_purpose = if purpose == "do" { "which".to_string() } else { format!("{purpose}: which") };
+            let which_purpose = if purpose == "do" {
+                "which".to_string()
+            } else {
+                format!("{purpose}: which")
+            };
             let answer = self.kev(&which_purpose, &prompt, &which, calls)?;
             msg["option"] = answer["which"]["choice"].clone();
-            if let Some(label) = msg["option"].as_str().and_then(|id| targets.get(id)).and_then(Value::as_str) {
+            if let Some(label) = msg["option"]
+                .as_str()
+                .and_then(|id| targets.get(id))
+                .and_then(Value::as_str)
+            {
                 line = format!("{line}: {label}");
             }
         }
@@ -579,7 +786,10 @@ impl Brain {
         let (name, player) = (self.cfg.mate.name.clone(), self.player());
         let start = Instant::now();
         let Some(mut view) = self.link.view(Duration::from_secs(2)) else {
-            self.trace.add("sight", json!({"kind": kind, "error": "the game sent no view"}));
+            self.trace.add(
+                "sight",
+                json!({"kind": kind, "error": "the game sent no view"}),
+            );
             return Ok(("he can't see it".to_string(), Value::Null));
         };
         let choose = kind == "choose";
@@ -587,12 +797,19 @@ impl Brain {
             picture::mark(&mut view.rgb, view.width, view.height, &view.spots);
         }
         let png = picture::png(&view.rgb, view.width, view.height);
-        let file = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().to_string();
+        let file = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .to_string();
         let views = self.cfg.base_dir.join("logs").join("views");
         let _ = std::fs::create_dir_all(&views);
         let _ = std::fs::write(views.join(format!("{file}.png")), &png);
 
-        let game = self.state()["game"].as_str().unwrap_or("a game").to_string();
+        let game = self.state()["game"]
+            .as_str()
+            .unwrap_or("a game")
+            .to_string();
         let eyes = format!("You're the eyes of {name}, {player}'s teammate in {game}: you're shown what {player} is looking at.");
         let (system, question) = if choose {
             (
@@ -606,7 +823,10 @@ impl Brain {
             )
         };
         let newest = self.memory.feed[self.memory.feed.len().saturating_sub(12)..].join("\n");
-        let question = format!("{}\n\nWhat's been happening, newest last:\n{newest}\n\n{question}", self.right_now());
+        let question = format!(
+            "{}\n\nWhat's been happening, newest last:\n{newest}\n\n{question}",
+            self.right_now()
+        );
         let mut request = json!({
             "model": self.cfg.llm.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": ""}],
@@ -614,7 +834,9 @@ impl Brain {
             "stream": false,
         });
         if choose {
-            let spots: Vec<u64> = std::iter::once(0).chain(view.spots.iter().filter_map(|s| s["id"].as_u64())).collect();
+            let spots: Vec<u64> = std::iter::once(0)
+                .chain(view.spots.iter().filter_map(|s| s["id"].as_u64()))
+                .collect();
             request["response_format"] = json!({"type": "json_schema", "json_schema": {"name": "spot", "schema": {
                 "type": "object",
                 "properties": {"place": {"type": "string", "maxLength": 80}, "spot": {"type": "integer", "enum": spots}},
@@ -623,30 +845,52 @@ impl Brain {
         }
         // (the picture in the request, and as traced: by its file, not its data)
         let mut traced = request.clone();
-        for (request, url) in [(&mut request, format!("data:image/png;base64,{}", picture::base64(&png))), (&mut traced, format!("/view?name={file}"))] {
-            request["messages"][1]["content"] =
-                json!([{"type": "text", "text": question}, {"type": "image_url", "image_url": {"url": url}}]);
+        for (request, url) in [
+            (
+                &mut request,
+                format!("data:image/png;base64,{}", picture::base64(&png)),
+            ),
+            (&mut traced, format!("/view?name={file}")),
+        ] {
+            request["messages"][1]["content"] = json!([{"type": "text", "text": question}, {"type": "image_url", "image_url": {"url": url}}]);
         }
         let output = match self.agent.post(&self.cfg.llm.url).send_json(&request) {
-            Ok(response) => response.into_json::<Value>()?["choices"][0]["message"]["content"].as_str().unwrap_or_default().trim().to_string(),
+            Ok(response) => response.into_json::<Value>()?["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
             Err(e) => {
                 let error = match e {
-                    ureq::Error::Status(code, response) => format!("{code}: {}", response.into_string().unwrap_or_default()),
+                    ureq::Error::Status(code, response) => {
+                        format!("{code}: {}", response.into_string().unwrap_or_default())
+                    }
                     other => other.to_string(),
                 };
                 eprintln!("[sight] {kind} failed: {error}");
-                self.trace.add("sight", json!({"kind": kind, "request": traced, "picture": file, "error": error}));
+                self.trace.add(
+                    "sight",
+                    json!({"kind": kind, "request": traced, "picture": file, "error": error}),
+                );
                 return Ok(("he can't see it".to_string(), json!(file)));
             }
         };
         let what = if choose {
             let answer: Value = serde_json::from_str(&output).unwrap_or_default();
             let spot = answer["spot"].as_u64().unwrap_or(0);
-            match view.spots.iter().find(|s| spot > 0 && s["id"].as_u64() == Some(spot)) {
+            match view
+                .spots
+                .iter()
+                .find(|s| spot > 0 && s["id"].as_u64() == Some(spot))
+            {
                 Some(found) => {
                     msg["option"] = json!(spot.to_string());
                     self.link.send_json(msg);
-                    format!("{} ({} m off)", answer["place"].as_str().unwrap_or("there").trim(), found["metres"])
+                    format!(
+                        "{} ({} m off)",
+                        answer["place"].as_str().unwrap_or("there").trim(),
+                        found["metres"]
+                    )
                 }
                 None => "none that fits".to_string(),
             }
@@ -666,15 +910,39 @@ impl Brain {
                 "ms": start.elapsed().as_millis() as u64,
             }),
         );
-        println!("[sight] {kind}: {what} ({} ms)", start.elapsed().as_millis());
+        println!(
+            "[sight] {kind}: {what} ({} ms)",
+            start.elapsed().as_millis()
+        );
         Ok((what, json!(file)))
     }
 
     /// Asks Kev the questions about `input`; the call, what went in and came out, goes in `calls`.
-    fn kev(&self, purpose: &str, input: &str, questions: &Value, calls: &mut Vec<Value>) -> Result<Value> {
+    fn kev(
+        &self,
+        purpose: &str,
+        input: &str,
+        questions: &Value,
+        calls: &mut Vec<Value>,
+    ) -> Result<Value> {
         let start = Instant::now();
         let request = json!({"model": self.cfg.kev.model, "state": input, "questions": questions});
-        let resp: Value = self.agent.post(&self.cfg.kev.url).send_json(&request)?.into_json()?;
+        let result = self
+            .kev_agent
+            .post(&self.cfg.kev.url)
+            .send_json(&request)
+            .map_err(anyhow::Error::from)
+            .and_then(|response| response.into_json().map_err(anyhow::Error::from));
+        let resp: Value = match result {
+            Ok(response) => response,
+            Err(error) => {
+                calls.push(
+                    json!({"purpose": purpose, "url": self.cfg.kev.url, "request": request,
+                    "error": format!("{error:#}"), "ms": start.elapsed().as_millis() as u64}),
+                );
+                return Err(error);
+            }
+        };
         calls.push(json!({
             "purpose": purpose,
             "url": self.cfg.kev.url,
@@ -693,26 +961,39 @@ impl Brain {
         let start = Instant::now();
         let generation = self.speaking.generation();
         let request = json!({"model": self.cfg.llm.model, "messages": messages, "temperature": self.cfg.llm.temperature, "stream": true});
-        let resp = self.agent.post(&self.cfg.llm.url).send_json(&request).map_err(|e| {
-            let detail = match e {
-                ureq::Error::Status(code, response) => format!("HTTP {code}: {}", response.into_string().unwrap_or_default()),
-                other => other.to_string(),
-            };
-            let error = format!("LLM at {} (model {:?}): {detail}", self.cfg.llm.url, self.cfg.llm.model);
-            self.trace.add("llm", json!({
-                "url": self.cfg.llm.url,
-                "model": self.cfg.llm.model,
-                "request": request,
-                "output": "",
-                "line": "",
-                "directions": [],
-                "first_token_ms": null,
-                "ms": start.elapsed().as_millis() as u64,
-                "cut_off": self.speaking.generation() != generation,
-                "error": error,
-            }));
-            anyhow::anyhow!(error)
-        })?;
+        let resp = self
+            .agent
+            .post(&self.cfg.llm.url)
+            .send_json(&request)
+            .map_err(|e| {
+                let detail = match e {
+                    ureq::Error::Status(code, response) => format!(
+                        "HTTP {code}: {}",
+                        response.into_string().unwrap_or_default()
+                    ),
+                    other => other.to_string(),
+                };
+                let error = format!(
+                    "LLM at {} (model {:?}): {detail}",
+                    self.cfg.llm.url, self.cfg.llm.model
+                );
+                self.trace.add(
+                    "llm",
+                    json!({
+                        "url": self.cfg.llm.url,
+                        "model": self.cfg.llm.model,
+                        "request": request,
+                        "output": "",
+                        "line": "",
+                        "directions": [],
+                        "first_token_ms": null,
+                        "ms": start.elapsed().as_millis() as u64,
+                        "cut_off": self.speaking.generation() != generation,
+                        "error": error,
+                    }),
+                );
+                anyhow::anyhow!(error)
+            })?;
         // (he's talking from here until speak.rs has voiced the End below: always sent)
         self.speaking.begin_line();
         let mut failed = None;
@@ -729,7 +1010,9 @@ impl Brain {
         let speak = |sentence: String, how: &str| {
             let sentence = sentence.trim().to_string();
             if !sentence.is_empty() {
-                let _ = self.speech.send(SpeechJob::Sentence(sentence, how.to_string(), generation));
+                let _ =
+                    self.speech
+                        .send(SpeechJob::Sentence(sentence, how.to_string(), generation));
             }
         };
         for line in BufReader::new(resp.into_reader()).lines() {
@@ -744,7 +1027,9 @@ impl Brain {
                     break;
                 }
             };
-            let Some(data) = line.strip_prefix("data: ") else { continue };
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
             if data.trim() == "[DONE]" {
                 break;
             }
@@ -788,7 +1073,10 @@ impl Brain {
         let _ = self.speech.send(SpeechJob::End(generation));
         // (his turn as he wrote it, every note and paragraph: as the LLM sees its own lines)
         let line = full.trim().to_string();
-        println!("[llm] {name}: \"{line}\" ({} ms)", start.elapsed().as_millis());
+        println!(
+            "[llm] {name}: \"{line}\" ({} ms)",
+            start.elapsed().as_millis()
+        );
         self.trace.add(
             "llm",
             json!({
@@ -849,12 +1137,25 @@ impl SentenceSplitter {
 /// The sounds the voice makes (Breeze TTS's four), by the ways the LLM writes them in a line:
 /// "(sighs)" is said as "(sigh)". Anything else in round brackets isn't said.
 const SOUNDS: [(&str, &str); 19] = [
-    ("laugh", "(laugh)"), ("laughs", "(laugh)"), ("laughing", "(laugh)"), ("laughter", "(laugh)"),
-    ("chuckle", "(laugh)"), ("chuckles", "(laugh)"), ("chuckling", "(laugh)"), ("giggles", "(laugh)"),
-    ("snickers", "(laugh)"), ("cackles", "(laugh)"),
-    ("sigh", "(sigh)"), ("sighs", "(sigh)"), ("sighing", "(sigh)"),
-    ("cough", "(cough)"), ("coughs", "(cough)"), ("coughing", "(cough)"),
-    ("clears throat", "(clears throat)"), ("clears his throat", "(clears throat)"), ("clearing throat", "(clears throat)"),
+    ("laugh", "(laugh)"),
+    ("laughs", "(laugh)"),
+    ("laughing", "(laugh)"),
+    ("laughter", "(laugh)"),
+    ("chuckle", "(laugh)"),
+    ("chuckles", "(laugh)"),
+    ("chuckling", "(laugh)"),
+    ("giggles", "(laugh)"),
+    ("snickers", "(laugh)"),
+    ("cackles", "(laugh)"),
+    ("sigh", "(sigh)"),
+    ("sighs", "(sigh)"),
+    ("sighing", "(sigh)"),
+    ("cough", "(cough)"),
+    ("coughs", "(cough)"),
+    ("coughing", "(cough)"),
+    ("clears throat", "(clears throat)"),
+    ("clears his throat", "(clears throat)"),
+    ("clearing throat", "(clears throat)"),
 ];
 
 /// A piece of the LLM's streamed line: what he says, or a "[how he says it]" note, which holds
@@ -885,7 +1186,9 @@ impl Notes {
                 pieces.push(Piece::Text(self.buf[..open].to_string()));
                 self.buf.drain(..open);
             }
-            let Some(close) = self.buf.find(']') else { break };
+            let Some(close) = self.buf.find(']') else {
+                break;
+            };
             pieces.push(Piece::Note(self.buf[1..close].trim().to_string()));
             self.buf.drain(..=close);
         }
@@ -904,7 +1207,10 @@ fn clean(text: &str) -> String {
         if depth == 0 && c == '(' {
             let sound = rest[1..].find(')').and_then(|end| {
                 let written = rest[1..1 + end].trim().to_lowercase();
-                SOUNDS.iter().find(|(as_written, _)| *as_written == written).map(|(_, said)| (said, end + 2))
+                SOUNDS
+                    .iter()
+                    .find(|(as_written, _)| *as_written == written)
+                    .map(|(_, said)| (said, end + 2))
             });
             if let Some((said, length)) = sound {
                 unbracketed.push_str(said);
@@ -923,54 +1229,18 @@ fn clean(text: &str) -> String {
     let filtered: String = unbracketed
         .chars()
         .filter(|c| !matches!(c, '*' | '_' | '#' | '~' | '`'))
-        .filter(|&c| !(('\u{1F000}'..='\u{1FAFF}').contains(&c) || ('\u{2600}'..='\u{27BF}').contains(&c)))
+        .filter(|&c| {
+            !(('\u{1F000}'..='\u{1FAFF}').contains(&c) || ('\u{2600}'..='\u{27BF}').contains(&c))
+        })
         .collect();
     let collapsed = filtered.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed.trim_matches(|c: char| c == '"' || c == '\u{201C}' || c == '\u{201D}').trim();
+    let trimmed = collapsed
+        .trim_matches(|c: char| c == '"' || c == '\u{201C}' || c == '\u{201D}')
+        .trim();
     if trimmed.chars().any(char::is_alphanumeric) {
         trimmed.to_string()
     } else {
         String::new()
-    }
-}
-
-/// Clef may choose only an intent clearly present in the current utterance.
-/// This small literal guard keeps a mistaken model answer from turning
-/// conversation, quotations, conditionals or compound requests into orders.
-fn explicit_command(text: &str, intent: &str, name: &str) -> bool {
-    if text.contains(['"', '“', '”']) {
-        return false;
-    }
-    let normalized: String = text.to_lowercase().chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
-    let words = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut command = words.as_str();
-    let name = name.to_lowercase();
-    for _ in 0..4 {
-        let before = command;
-        for prefix in ["hey ", "please ", "can you ", "could you ", "would you "] {
-            if let Some(rest) = command.strip_prefix(prefix) { command = rest; break; }
-        }
-        for address in [name.as_str(), if name == "kevin" { "kev" } else { name.as_str() }] {
-            if let Some(rest) = command.strip_prefix(address).and_then(|s| s.strip_prefix(' ')) {
-                command = rest;
-                break;
-            }
-        }
-        if command == before { break; }
-    }
-    for _ in 0..2 {
-        if let Some(rest) = command.strip_suffix(" please").or_else(|| command.strip_suffix(" now")) {
-            command = rest;
-        }
-    }
-    match intent {
-        "follow" => matches!(command, "follow" | "follow me" | "follow chief" | "follow the chief" | "come with me" | "resume following"),
-        "stay" => matches!(command, "stay" | "stay here" | "hold position" | "hold your position" | "wait here" | "stop moving"),
-        "go_aim" => matches!(command, "go there" | "move there" | "go aim" | "go where i am aiming" | "go where i m aiming" | "move where i am aiming" | "move where i m aiming"),
-        "hold_fire" => matches!(command, "hold fire" | "hold your fire" | "cease fire" | "cease firing" | "stop shooting" | "stop firing" | "do not shoot" | "don t shoot" | "don t fire" | "weapons tight"),
-        "resume_fire" => matches!(command, "resume fire" | "resume firing" | "start shooting" | "start firing" | "fire at will" | "you can shoot" | "you can fire" | "weapons free"),
-        _ => false,
     }
 }
 
@@ -1106,7 +1376,14 @@ mod tests {
 
     #[test]
     fn rejected_dialogue_requests_are_recorded_with_router_error() {
-        let server = MockHttp::new(|_, stream| reply(stream, 404, &[("Content-Type", "application/json")], br#"{"error":{"message":"no router for requested model"}}"#));
+        let server = MockHttp::new(|_, stream| {
+            reply(
+                stream,
+                404,
+                &[("Content-Type", "application/json")],
+                br#"{"error":{"message":"no router for requested model"}}"#,
+            )
+        });
         let dir = TestDir::new();
         let (mut brain, jobs, _, _peer) = fixture(&server, &dir);
         let error = brain.say().unwrap_err();
@@ -1114,10 +1391,25 @@ mod tests {
         assert!(error.to_string().contains("no router for requested model"));
         assert!(jobs.try_recv().is_err());
         assert!(brain.speaking.quiet_from().is_some());
-        let log = std::fs::read_dir(&dir.0).unwrap().next().unwrap().unwrap().path();
-        let entry: Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().lines().last().unwrap()).unwrap();
+        let log = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let entry: Value = serde_json::from_str(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(entry["kind"], "llm");
-        assert!(entry["data"]["error"].as_str().unwrap().contains("no router for requested model"));
+        assert!(entry["data"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no router for requested model"));
         assert_eq!(entry["data"]["request"]["model"], "gemma4-12b-mtp-vision");
     }
 
@@ -1260,8 +1552,12 @@ mod tests {
             let body = request.json();
             assert_eq!(body["questions"].as_object().unwrap().len(), 1);
             assert_eq!(body["questions"]["speak"]["type"], "noul");
-            reply(stream, 200, &[("Content-Type", "application/json")],
-                br#"{"answers":{"speak":{"noul":0.8}}}"#);
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                br#"{"answers":{"speak":{"noul":0.8}}}"#,
+            );
         });
         let dir = TestDir::new();
         let (mut brain, _, _, _peer) = fixture(&server, &dir);
@@ -1274,26 +1570,23 @@ mod tests {
     }
 
     #[test]
-    fn explicit_command_guard_refuses_ambiguous_or_misclassified_orders() {
-        for (text, intent) in [("I used to follow Chief", "follow"), ("Maybe stay nearby", "stay"),
-            ("If we move, follow me", "follow"), ("He said \"stay here\"", "stay"),
-            ("Don't follow me", "follow"), ("Hold fire", "stay"),
-            ("Follow me and stop shooting", "follow"), ("Go to that room", "go_aim")] {
-            assert!(!explicit_command(text, intent, "Kevin"), "{text}");
-        }
-        for (text, intent) in [("Kevin, please follow me", "follow"), ("Can you stay here?", "stay"),
-            ("Go there.", "go_aim"), ("Don't shoot", "hold_fire"), ("Kev, fire at will now", "resume_fire")] {
-            assert!(explicit_command(text, intent, "Kevin"), "{text}");
-        }
-    }
-
-    #[test]
     fn malformed_or_legacy_intents_are_none() {
-        for answer in [Value::Null, json!({"intent":{"choice":"shoot"}}),
-            json!({"intent":{"choice":12}}), json!({"do":{"choice":"follow"}})] {
+        for answer in [
+            Value::Null,
+            json!({"intent":{"choice":"shoot"}}),
+            json!({"intent":{"choice":12}}),
+            json!({"do":{"choice":"follow"}}),
+        ] {
             assert_eq!(command_intent(&answer), "none");
         }
-        for intent in ["none", "follow", "stay", "go_aim", "hold_fire", "resume_fire"] {
+        for intent in [
+            "none",
+            "follow",
+            "stay",
+            "go_aim",
+            "hold_fire",
+            "resume_fire",
+        ] {
             assert_eq!(command_intent(&json!({"intent":{"choice":intent}})), intent);
         }
     }
@@ -1307,24 +1600,36 @@ mod tests {
             assert_eq!(criteria.len(), 6);
             assert!(criteria.contains_key("none"));
             assert!(!body["state"].as_str().unwrap().contains("Cover me!"));
-            reply(stream, 200, &[("Content-Type", "application/json")],
-                br#"{"answers":{"intent":{"choice":"none"}}}"#);
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                br#"{"answers":{"intent":{"choice":"none"}}}"#,
+            );
         });
         let dir = TestDir::new();
         let (mut brain, _, _, mut peer) = fixture(&server, &dir);
-        brain.interpret_command("Do you remember home?", Some(123)).unwrap();
+        brain
+            .interpret_command("Do you remember home?", Some(123))
+            .unwrap();
         server.request();
         assert!(server.requests.try_recv().is_err());
-        peer.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
         use std::io::Read;
-        assert!(peer.read(&mut [0;1]).is_err());
+        assert!(peer.read(&mut [0; 1]).is_err());
     }
 
     #[test]
     fn command_uses_captured_context_and_waits_for_native_result() {
-        let server = MockHttp::new(|_, stream| reply(stream, 200,
-            &[("Content-Type", "application/json")],
-            br#"{"answers":{"intent":{"choice":"go_aim"}}}"#));
+        let server = MockHttp::new(|_, stream| {
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                br#"{"answers":{"intent":{"choice":"go_aim"}}}"#,
+            )
+        });
         let dir = TestDir::new();
         let (mut brain, _, _, mut peer) = fixture(&server, &dir);
         let native = std::thread::spawn(move || {
@@ -1332,15 +1637,293 @@ mod tests {
             assert_eq!(request["action"], "go_aim");
             assert_eq!(request["context_id"], 71);
             let result = json!({"type":"command_result", "request_id":request["request_id"],
-                "accepted":false,"text":"Unsafe landing."}).to_string();
+                "accepted":false,"text":"Unsafe landing."})
+            .to_string();
             peer.write_all(&[1]).unwrap();
-            peer.write_all(&(result.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(&(result.len() as u32).to_be_bytes())
+                .unwrap();
             peer.write_all(result.as_bytes()).unwrap();
         });
         brain.interpret_command("Go there.", Some(71)).unwrap();
         native.join().unwrap();
         assert!(brain.memory.feed.last().unwrap().contains("Unsafe landing"));
-        assert!(brain.memory.feed.last().unwrap().contains("previous orders retained"));
+        assert!(brain
+            .memory
+            .feed
+            .last()
+            .unwrap()
+            .contains("previous orders retained"));
+    }
+
+    fn trace_entries(dir: &TestDir) -> Vec<Value> {
+        let log = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .unwrap();
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn natural_language_intents_follow_clef_without_a_literal_guard() {
+        for (text, intent) in [
+            ("Kevin, get over here", "follow"),
+            ("Can you wait for me?", "stay"),
+            ("Head over where I'm pointing", "go_aim"),
+            ("Keep your finger off the trigger", "hold_fire"),
+            ("You're clear to engage again", "resume_fire"),
+        ] {
+            let server = MockHttp::new(move |request, stream| {
+                let body = request.json();
+                assert_eq!(
+                    body["state"],
+                    format!(
+                        "Current player utterance: {}",
+                        serde_json::to_string(text).unwrap()
+                    )
+                );
+                assert_eq!(body["questions"].as_object().unwrap().len(), 1);
+                let instructions = body["questions"]["intent"]["instructions"]
+                    .as_str()
+                    .unwrap();
+                for word in [
+                    "conversation",
+                    "hypothetical",
+                    "quoted",
+                    "ambiguous",
+                    "conflicting",
+                    "unsupported",
+                ] {
+                    assert!(instructions.contains(word), "{word}");
+                }
+                reply(stream, 200, &[], json!({"answers":{"intent":{"choice":intent,"confidence":0.7,"probabilities":{"none":0.3}}}}).to_string().as_bytes());
+            });
+            let dir = TestDir::new();
+            let (mut brain, _, _, mut peer) = fixture(&server, &dir);
+            let native = std::thread::spawn(move || {
+                let action: Value = serde_json::from_slice(&frame(&mut peer).1).unwrap();
+                assert_eq!(action["action"], intent);
+                assert_eq!(action["context_id"], 71);
+                let response = json!({"type":"command_result","request_id":action["request_id"],"accepted":true,
+                    "movement_order":"follow","fire_enabled":true}).to_string();
+                peer.write_all(&[1]).unwrap();
+                peer.write_all(&(response.len() as u32).to_be_bytes())
+                    .unwrap();
+                peer.write_all(response.as_bytes()).unwrap();
+            });
+            brain.interpret_command(text, Some(71)).unwrap();
+            native.join().unwrap();
+            assert!(brain.memory.feed.last().unwrap().contains("Kevin is now"));
+            let entries = trace_entries(&dir);
+            assert_eq!(
+                entries.iter().find(|e| e["kind"] == "kev").unwrap()["data"]["calls"][0]
+                    ["response"]["answers"]["intent"]["confidence"],
+                0.7
+            );
+        }
+    }
+
+    // Exercise the actual sequential run loop with an utterance arriving while an
+    // HTTP request is blocked. The native mock also captures aim at enqueue time.
+    fn queued_utterances(delay_at: &str, timeout: bool, stale: bool) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let delayed_dialogue = delay_at == "dialogue";
+        let delay_at = delay_at.to_string();
+        let mut delayed = false;
+        let mut intents = 0;
+        let server = MockHttp::new(move |request, stream| {
+            let body = request.json();
+            let intent = !body["questions"]["intent"].is_null();
+            if !delayed
+                && ((delay_at == "intent" && intent)
+                    || (delay_at == "dialogue" && request.path.ends_with("completions")))
+            {
+                delayed = true;
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                if timeout {
+                    intents += 1;
+                    return;
+                }
+            }
+            if intent {
+                intents += 1;
+                reply(
+                    stream,
+                    200,
+                    &[],
+                    json!({"answers":{"intent":{"choice":if intents==1 {"go_aim"} else {"stay"}}}})
+                        .to_string()
+                        .as_bytes(),
+                );
+            } else if !body["questions"]["speak"].is_null() {
+                reply(stream, 200, &[], br#"{"answers":{"speak":{"noul":0}}}"#);
+            } else {
+                reply(stream,200,&[("Content-Type","text/event-stream")], b"data: {\"choices\":[{\"delta\":{\"content\":\"Okay.\"}}]}\n\ndata: [DONE]\n\n");
+            }
+        });
+        let dir = TestDir::new();
+        let (mut brain, _jobs, inputs_rx, mut peer) = fixture(&server, &dir);
+        brain.kev_agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(150))
+            .timeout_connect(Duration::from_millis(100))
+            .build();
+        let inputs = brain.inputs.clone();
+        let link = brain.link.clone();
+        let (actions_tx, actions_rx) = mpsc::channel();
+        let native = std::thread::spawn(move || {
+            let mut captured = 0;
+            let mut actions = 0;
+            loop {
+                let request: Value = serde_json::from_slice(&frame(&mut peer).1).unwrap();
+                let response=match request["type"].as_str() {
+                    Some("capture_command")=> { captured+=1;json!({"type":"command_context","request_id":request["request_id"],"context_id":70+captured}) },
+                    Some("action")=> {
+                        assert!(request.get("context_id").is_some());actions+=1;actions_tx.send(request.clone()).unwrap();
+                        json!({"type":"command_result","request_id":request["request_id"],"accepted":!stale,
+                            "text":"Captured context expired; previous orders retained.","movement_order":"stay","fire_enabled":true})
+                    },
+                    _=>continue,
+                }.to_string();
+                peer.write_all(&[1]).unwrap();
+                peer.write_all(&(response.len() as u32).to_be_bytes())
+                    .unwrap();
+                peer.write_all(response.as_bytes()).unwrap();
+                if actions == if timeout { 1 } else { 2 } {
+                    assert_eq!(
+                        captured, 2,
+                        "never recapture when processing queued commands"
+                    );
+                    break;
+                }
+            }
+        });
+        let event_budget = EventBudget::default();
+        for _ in 0..100 {
+            event_budget.send(&inputs, "Repeated game event".into(), false);
+        }
+        inputs
+            .send(Input::heard("Head over where I'm pointing".into(), &link))
+            .unwrap();
+        let runner = std::thread::spawn(move || brain.run(inputs_rx));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        inputs
+            .send(Input::heard("Can you wait for me?".into(), &link))
+            .unwrap();
+        // A later event can only ask whether to speak; it cannot change the order.
+        let budget = EventBudget::default();
+        budget.send(&inputs, "An enemy moved nearby".into(), true);
+        inputs.send(Input::Stop).unwrap();
+        if timeout || delayed_dialogue {
+            std::thread::sleep(Duration::from_millis(220));
+        }
+        release_tx.send(()).unwrap();
+        runner.join().unwrap();
+        native.join().unwrap();
+        let actions: Vec<_> = actions_rx.try_iter().collect();
+        assert_eq!(actions.len(), if timeout { 1 } else { 2 });
+        if !timeout {
+            assert_eq!(actions[0]["context_id"], 71);
+            assert_eq!(actions[0]["action"], "go_aim");
+        }
+        assert_eq!(actions.last().unwrap()["context_id"], 72);
+        assert_eq!(actions.last().unwrap()["action"], "stay");
+        let entries = trace_entries(&dir);
+        let heard: Vec<_> = entries
+            .iter()
+            .filter(|e| e["kind"] == "heard")
+            .map(|e| e["data"]["text"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            heard,
+            vec!["Head over where I'm pointing", "Can you wait for me?"]
+        );
+        assert_eq!(entries.iter().filter(|e| e["kind"] == "llm").count(), 2);
+        if timeout {
+            let failed = entries
+                .iter()
+                .find(|e| e["kind"] == "kev" && !e["data"]["error"].is_null())
+                .unwrap();
+            assert!(failed["data"]["ms"].as_u64().unwrap() < 600);
+            assert!(failed["data"]["calls"][0]["error"].is_string());
+        }
+        if stale {
+            assert!(entries
+                .iter()
+                .filter(|e| e["kind"] == "command")
+                .all(|e| e["data"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("previous orders retained")));
+        }
+    }
+
+    #[test]
+    fn utterance_queued_during_intent_keeps_its_own_context() {
+        queued_utterances("intent", false, false);
+    }
+    #[test]
+    fn utterance_queued_during_dialogue_keeps_its_own_context() {
+        queued_utterances("dialogue", false, false);
+    }
+    #[test]
+    fn intent_timeout_preserves_later_input_and_dialogue() {
+        queued_utterances("intent", true, false);
+    }
+    #[test]
+    fn stale_backlogged_commands_are_rejected_without_recapture() {
+        queued_utterances("dialogue", false, true);
+    }
+
+    #[test]
+    fn event_budget_bounds_batches_without_losing_player_input() {
+        let budget = EventBudget::default();
+        let (tx, rx) = mpsc::channel();
+        for _ in 0..10000 {
+            budget.send(&tx, "repeated event".into(), true);
+        }
+        tx.send(Input::Heard {
+            text: "Stay here".into(),
+            context: Some(73),
+        })
+        .unwrap();
+        let queued: Vec<_> = rx.try_iter().collect();
+        assert_eq!(queued.len(), 65);
+        assert_eq!(budget.0.pending.load(Ordering::Relaxed), 64);
+        assert_eq!(budget.0.dropped.load(Ordering::Relaxed), 9936);
+        assert!(matches!(
+            queued.last(),
+            Some(Input::Heard {
+                context: Some(73),
+                ..
+            })
+        ));
+        drop(queued);
+        assert_eq!(budget.0.pending.load(Ordering::Relaxed), 0);
+        budget.send(&tx, "new event".into(), true);
+        assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn event_timeout_skips_optional_speech_and_traces_failure() {
+        let server = MockHttp::new(|_, _| std::thread::sleep(Duration::from_millis(120)));
+        let dir = TestDir::new();
+        let (mut brain, _, _, _peer) = fixture(&server, &dir);
+        brain.kev_agent = ureq::AgentBuilder::new()
+            .timeout(Duration::from_millis(40))
+            .build();
+        let start = Instant::now();
+        assert!(!brain.decide(false, false).unwrap());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        let entries = trace_entries(&dir);
+        assert!(entries[0]["data"]["calls"][0]["error"].is_string());
+        assert_eq!(entries[0]["data"]["speak"], false);
     }
 
     #[test]
