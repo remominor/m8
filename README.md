@@ -1,10 +1,10 @@
 # m8
 
 A voice brain for AI companions in games. You talk to your mate out loud; it hears the game,
-decides what to do, does it, and answers in a voice of its own.
+interprets your commands and answers in a voice of its own. The game runs ordinary movement and combat.
 
 m8 knows nothing about any one game. The game tells it what's going on, in words, and what the
-mate can do right now; m8 sends back what the mate does, and its voice. Hook up any game that
+mate can do right now; m8 sends explicit player orders and its voice. Hook up any game that
 can open a socket, plug in the models you like, write a persona.
 
 > **Not a release.** This is a working setup shared as it is, for power users to pull, fork and
@@ -19,10 +19,9 @@ with it is **Kevin**, a Spartan ([examples/kevin](examples/kevin)).
 
 1. Something comes in: you said something (mic, or typed), or the game sent an event.
 2. It goes in the feed: everything said and done, the mate's own actions too.
-3. The decision model picks one of the actions the game offers (or none), and its target. An
-   action can report back (a search: what it found goes in the feed, and the model picks again
-   from what that offers), or need the player's view (the LLM looks at a frame from the game:
-   says what's there, or picks one of the spots marked on the ground).
+3. Player speech gets one focused command choice: none, follow, stay, go to the aimed ground,
+   hold fire, or resume fire. Clear supported commands are validated by the game before dialogue;
+   ordinary conversation leaves orders unchanged. OpenCE handles following, recovery and combat.
 4. For the game's events, the decision model says whether the mate speaks. Your lines are always
    answered. After the mate stops talking, the game's events can't start it again until the
    cooldown (the game sends it).
@@ -41,7 +40,7 @@ like, local or not. It speaks the APIs of what I used:
 
 | Job | API m8 calls | Configured service |
 | --- | --- | --- |
-| Decide | llama.cpp's `/v1/systemone` (`[kev] url`, `model`) | Clef-Flash Artemis through Unraid llama-swap (`clef-flash-artemis`); m8 retains its existing scoring questions and newest 20 feed lines |
+| Decide | llama.cpp's `/v1/systemone` (`[kev] url`, `model`) | Clef-Flash Artemis through Unraid llama-swap (`clef-flash-artemis`); one player-intent choice; event speech relevance uses `noul` and newest 20 feed lines |
 | Talk and see | OpenAI-style `/v1/chat/completions` (`[llm] url`, `model`), including image messages | Local llama-swap, Gemma 4 12B QAT HauhauCS Balanced Q4_K_M with MTP and vision (`gemma4-12b-mtp-vision`) |
 | Speak | JSON `/v1/audio/speech` appended to `[mate] voice_server`, streaming PCM | [Breeze TTS API](https://github.com/remominor/breeze-tts-api) on Unraid, saved `soldier` profile |
 | Hear | Multipart `/v1/audio/transcriptions` (`[stt] url`, `model`) | Parakeet Unified on Unraid (`parakeet`), 16 kHz mono WAV; no diarization or speaker identity |
@@ -62,37 +61,29 @@ restarts. Frames are `[u8 kind][u32 big-endian length][payload]`:
 | 3 | to m8 | dialogue the game played, to hear: `[u16 length][JSON: speaker, radio, react, sample_rate][mono 16-bit samples]` |
 | 4 | to m8 | the player's view, when asked: `[u16 length][JSON: width, height, spots][RGB rows]` |
 
-The game sends a `state` whenever things change (Kevin's sent one every tick):
+The game sends a `state` twice per second, including descriptive text, `movement_order`
+(`follow`, `stay`, `go_aim`) and `fire_enabled`. Its `actions` describe supported player commands;
+they are not a menu for routine model-driven gameplay.
 
-```json
-{"type": "state", "game": "Halo: Combat Evolved", "level": "a30", "in_combat": false, "on_radio": false,
- "state": "Kevin: unhurt, shields full, holding a pistol (12 rounds loaded), following {player}. {player}: close by ahead. Enemies: a grunt close (8 m) ahead.",
- "actions": [
-   {"name": "follow", "description": "follows {player}"},
-   {"name": "shoot", "description": "shoots at an enemy", "options": {"12": "grunt close (8 m) ahead"}},
-   {"name": "search_weapons", "description": "looks around for weapons", "result": "shotgun (4 m) ahead",
-    "then": [{"name": "pick_up", "description": "picks up a weapon", "options": {"88": "shotgun (4 m) ahead"}}]},
-   {"name": "look", "description": "takes a look at something {player} wants him to see", "view": "describe"},
-   {"name": "go_to", "description": "goes to a spot {player} can see", "view": "choose"}
- ]}
-```
+- At player-input ingress, m8 sends `{"type":"capture_command","request_id":1}`. The game replies
+  with `command_context`, the matching `request_id`, a `context_id` and `aim_valid`. Native console
+  speech (`direct`) already carries a captured `context_id`.
+- A clear command becomes `{"type":"action","action":"go_aim","context_id":17,"request_id":2}`.
+  The native controller checks the captured context and location before changing orders, then
+  replies with `command_result`, matching `request_id`, `accepted`, `movement_order`,
+  `fire_enabled` and explanatory `text`. Invalid or expired requests preserve live orders.
+- `{player}` in state/event text becomes the player's name (`player_name.txt`).
+- `event` carries `text` and `react` (false only notes it). `saved`/`loaded` carry the save `id`.
+  `companion_notice` records native transitions in history without speech or conversational memory.
+- Existing `mic`, `settings`, `hello`, `say`, `heard`, `view`, `stop_audio`, `audio_end` and binary
+  voice/vision frames retain their roles.
 
-- `state` is read as words, so say it the way you'd tell someone. `{player}` becomes the
-  player's name (`player_name.txt`).
-- Each action is a line the decision model picks from ("Kevin follows Chasm"). `options` are its
-  targets; `result` is what doing it finds, and `then` what can be done about that; `view` asks
-  for the player's view (`describe`: say what's there; `choose`: pick one of its `spots`).
-- m8 answers with `{"type": "action", "action": "shoot", "option": "12"}`.
-
-Also from the game: `event` (`text`, and `react`: false to only note it), `saved` and `loaded`
-(with the save's `id`), `direct` (a game master's line), `mic` (`muted`), `settings`
-(`speech_cooldown`). From m8: `hello`, `say` (a line as it starts), `heard` (what you said),
-`view` (send the view), `stop_audio`, `audio_end`.
+See [Sprint 1](games/halo/SPRINT1.md) for protocol lifecycle behavior, diagnostics and gameplay checks.
 
 ## CachyOS / Unraid deployment
 
 The patched Linux OpenCE game is already built at `~/Projects/m8/halo/build/linux/halo`,
-with its extracted assets beside it. Keep that build and patch as they are. m8 does not start,
+with its extracted assets beside it. Preserve those assets and the Linux setup when rebuilding. m8 does not start,
 stop, or configure any model servers. Local llama-swap and the Unraid services are managed
 independently.
 

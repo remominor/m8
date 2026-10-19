@@ -4,11 +4,8 @@
 //! its newest lines, what holds right now (the combat or radio prompt while the game says so,
 //! and its current state).
 //!
-//! The player speaks -> the LLM answers -> Kev picks what the mate does.
-//! The game reports an event -> Kev picks what the mate does, and whether it speaks.
-//!
-//! The game decides what the mate can do: its state lists the actions, each with a short
-//! description and optionally targets (e.g. which enemy). Kev picks one.
+//! OpenCE owns ordinary movement, recovery and combat. Player utterances get one
+//! focused intent question; game events only ask whether Kevin should speak.
 //!
 //! Memory: when the feed gets long, the LLM folds its oldest lines into a short summary. The
 //! game's saves carry the memory: a save stores it, and loading that save brings it back (dying
@@ -30,16 +27,26 @@ use std::time::{Duration, Instant};
 
 pub enum Input {
     /// Something the player said (mic, console or the site).
-    Heard(String),
+    Heard { text: String, context: Option<u64> },
     /// Something that happened in the game, in words. `react`: Kev picks what the mate does
     /// about it (and whether it speaks); without, it only goes into the feed (e.g. dialogue in a
     /// cutscene).
     Event { text: String, react: bool },
     /// The game saved (its id for the save), or loaded a save.
     Saved(String),
+    /// Native diagnostics for history only; never conversational telemetry.
+    Notice(String),
     Loaded(String),
     /// A summary of the feed's oldest lines is ready.
     Summary { memory: u64, folded: usize, text: String },
+}
+
+impl Input {
+    /// Capture before queueing: slow dialogue/classification must not move the
+    /// destination to whatever Chief happens to aim at later.
+    pub fn heard(text: String, link: &GameLink) -> Self {
+        Self::Heard { text, context: link.capture_command() }
+    }
 }
 
 /// The feed's size, in tokens (counted as 4 characters each): over FEED_TOKENS, at a safe point
@@ -149,7 +156,7 @@ impl Brain {
                 quiet_since = Instant::now();
             }
             let result = match input {
-                Input::Heard(text) => self.on_heard(&text),
+                Input::Heard { text, context } => self.on_heard(&text, context),
                 Input::Event { text, react } => {
                     // (and the events that came in meanwhile, all at once: he reacts to what's
                     // happened since, not to each in turn, falling behind)
@@ -166,6 +173,10 @@ impl Brain {
                     self.on_events(&events)
                 }
                 Input::Saved(id) => self.on_saved(id),
+                Input::Notice(text) => {
+                    self.trace.add("companion", json!({"text": text}));
+                    Ok(())
+                }
                 Input::Loaded(id) => self.on_loaded(&id),
                 Input::Summary { memory, folded, text } => self.on_summary(memory, folded, text),
             };
@@ -176,11 +187,16 @@ impl Brain {
         }
     }
 
-    fn on_heard(&mut self, text: &str) -> Result<()> {
+    fn on_heard(&mut self, text: &str, context: Option<u64>) -> Result<()> {
         self.link.send_json(&json!({"type": "heard", "text": text}));
         let player = self.player();
         self.memory.feed.push(format!("{player}: {text}"));
         self.trace.add("heard", json!({"text": text}));
+        // A command failure must not take down the ordinary conversation.
+        if let Err(error) = self.interpret_command(text, context) {
+            self.trace.add("command", json!({"text": text, "error": format!("{error:#}")}));
+            self.memory.feed.push("(Command interpretation failed; no player order was sent.)".into());
+        }
         self.respond(true)
     }
 
@@ -197,11 +213,8 @@ impl Brain {
         Ok(())
     }
 
-    /// To what just came in (the player's line or the game's): Kev picks what the mate does,
-    /// which goes in the feed, then (for the game's) whether he speaks; if so, the LLM says it,
-    /// knowing what he did. The player is always answered. The game's can't have him talk while
-    /// he's talking, nor until the cooldown (the game's setting) after his voice stops: Kev
-    /// only picks what he does.
+    /// Player speech always gets dialogue; game events use Clef's speech
+    /// relevance decision and the existing voice cooldown/interruption path.
     fn respond(&mut self, to_player: bool) -> Result<()> {
         let cooldown = !to_player
             && self.speaking.quiet_from().map_or(true, |quiet| Instant::now() < quiet + self.link.speech_cooldown());
@@ -434,73 +447,83 @@ impl Brain {
         messages
     }
 
-    /// Kev picks what the mate does, then whether he speaks (returned; not asked of the player's
-    /// line, which is answered, nor in the cooldown). What he does goes in the feed ("Kevin
-    /// stands up."), for the LLM to see before it says anything. An action that reports back (a
-    /// search) puts what it found there too, and Kev picks again from what it offers to do
-    /// about it (its "then").
-    fn decide(&mut self, to_player: bool, cooldown: bool) -> Result<bool> {
-        let name = self.cfg.mate.name.clone();
-        let start = Instant::now();
-        // (each call to Kev, with what went in and came out, for the history page)
+    /// Exactly one intent choice for the current utterance. The general scene
+    /// prompt is deliberately excluded: earlier lines and events are not orders.
+    fn interpret_command(&mut self, text: &str, context: Option<u64>) -> Result<()> {
+        let started = Instant::now();
         let mut calls = Vec::new();
-        let actions = self.state()["actions"].as_array().cloned().unwrap_or_default();
-        let done = self.act("do", &actions, &mut calls)?;
-        let then = actions
-            .iter()
-            .find(|a| a["name"] == done["action"])
-            .and_then(|a| a["then"].as_array())
-            .filter(|then| !then.is_empty())
-            .cloned();
-        let then_done = match then {
-            Some(then) => self.act("then", &then, &mut calls)?,
-            None => Value::Null,
+        let question = json!({"intent": {
+            "type": "choice",
+            "instructions": "Interpret ONLY the player's current utterance. Execute only an explicit, unambiguous instruction addressed to Kevin. Choose none for ordinary conversation, descriptions, jokes, quotations, negated or hypothetical commands, vague requests, unsupported actions, multiple conflicting orders, or unclear destinations. A location command must clearly mean the ground Chief was aiming at when speaking. Never infer an order from game events or prior dialogue.",
+            "criteria": {
+                "none": "No clear supported instruction; preserve every current order.",
+                "follow": "Explicitly tells Kevin to follow Chief.",
+                "stay": "Explicitly tells Kevin to stay or hold his current position.",
+                "go_aim": "Explicitly tells Kevin to move to the ground Chief is pointing or aiming at, such as go there.",
+                "hold_fire": "Explicitly tells Kevin to stop shooting or hold fire.",
+                "resume_fire": "Explicitly tells Kevin to resume shooting or fire at will."
+            }
+        }});
+        let prompt = format!("Current player utterance: {}", serde_json::to_string(text)?);
+        let answer = self.kev("intent", &prompt, &question, &mut calls)?;
+        let intent = command_intent(&answer);
+        self.trace.add("kev", json!({"calls": calls, "action": intent, "sent": false, "purpose": "intent", "ms": started.elapsed().as_millis() as u64}));
+        if intent == "none" {
+            return Ok(());
+        }
+        if !explicit_command(text, intent, &self.cfg.mate.name) {
+            self.trace.add("command", json!({"intent": intent, "sent": false, "text": "Unclear or unsupported command wording; orders unchanged."}));
+            self.memory.feed.push("(No gameplay order was sent: the wording did not clearly match a supported command.)".into());
+            return Ok(());
+        }
+        let result = context.and_then(|id| self.link.request(
+            json!({"type": "action", "action": intent, "context_id": id}),
+            Duration::from_secs(1),
+        ));
+        let outcome = match result.as_ref() {
+            Some(reply) if reply["accepted"].as_bool() == Some(true) => format!(
+                "Kevin is now {}, with autonomous fire {}.",
+                match reply["movement_order"].as_str() {
+                    Some("follow") => "following Chief",
+                    Some("stay") => "holding position",
+                    Some("go_aim") => "moving to the requested location",
+                    _ => "keeping his current movement order",
+                },
+                if reply["fire_enabled"].as_bool() == Some(true) { "enabled" } else { "disabled" },
+            ),
+            Some(reply) => format!("Order rejected; previous orders retained. {}",
+                reply["text"].as_str().unwrap_or("The game could not validate this order.")),
+            None if context.is_none() => "No order was sent because the game was unavailable when you spoke; please repeat the order.".into(),
+            None => "The order was sent but the game has not confirmed it; do not claim it succeeded.".into(),
         };
-        // (then whether he speaks, with what he just did in the feed; Kev's yes or no: yes when
-        // it's the likelier)
+        self.trace.add("command", json!({"intent": intent, "context_id": context, "result": result, "text": outcome}));
+        self.memory.feed.push(format!("({outcome})"));
+        Ok(())
+    }
+
+    /// Events only ask about speech, with the established cooldown. Player
+    /// conversation always gets an answer; its intent was handled separately.
+    fn decide(&mut self, to_player: bool, cooldown: bool) -> Result<bool> {
+        if to_player {
+            return Ok(true);
+        }
+        let start = Instant::now();
+        let mut calls = Vec::new();
         let ask_speak = !to_player && !cooldown;
         let speak = to_player || ask_speak && {
-            let speak_question = json!({"speak": {"type": "noul", "instructions": format!("Should {name} speak now?")}});
-            let spoken = self.kev("speak", &self.prompt(), &speak_question, &mut calls)?;
-            spoken["speak"]["noul"].as_f64().unwrap_or(0.0) >= 0.5
+            let question = json!({"speak": {"type": "noul", "instructions": format!("Should {} speak now?", self.cfg.mate.name)}});
+            self.kev("speak", &self.prompt(), &question, &mut calls)?["speak"]["noul"].as_f64().unwrap_or(0.0) >= 0.5
         };
-        self.trace.add(
-            "kev",
-            json!({
-                "calls": calls,
-                "action": done["action"],
-                "option": done["option"],
-                "sent": done["action"] != "nothing",
-                "seen": done["seen"],
-                // (what he did about what an action found, if it offered anything)
-                "then": then_done,
-                "speak": speak,
-                "speak_asked": ask_speak,
-                // (not asked: he's talking, or his voice stopped under the cooldown ago)
-                "cooldown": cooldown,
-                "ms": start.elapsed().as_millis() as u64,
-            }),
-        );
-        let did = |done: &Value| {
-            format!(
-                "{}{}",
-                done["action"].as_str().unwrap_or("nothing"),
-                done["option"].as_str().map(|o| format!(" {o}")).unwrap_or_default()
-            )
-        };
-        println!(
-            "[kev] {}{}, speak {} ({} ms)",
-            did(&done),
-            if then_done.is_null() { String::new() } else { format!(", then {}", did(&then_done)) },
-            if cooldown { "not asked (cooldown)" } else if speak { "yes" } else { "no" },
-            start.elapsed().as_millis()
-        );
+        self.trace.add("kev", json!({"calls": calls, "action": "none", "sent": false,
+            "speak": speak, "speak_asked": ask_speak, "cooldown": cooldown,
+            "ms": start.elapsed().as_millis() as u64}));
         Ok(speak)
     }
 
     /// Kev picks one of `actions` (or nothing), and for one with targets, which. It goes to the
     /// game and in the feed, with what it found (its "result"), or, for one of the player's view
     /// (its "view"), what the mate makes of that. What was done: its `action`, `option`, `seen`.
+    #[allow(dead_code)] // Legacy special actions are deliberately outside the active decision path.
     fn act(&mut self, purpose: &str, actions: &[Value], calls: &mut Vec<Value>) -> Result<Value> {
         let name = self.cfg.mate.name.clone();
         let mut options = serde_json::Map::new();
@@ -911,6 +934,54 @@ fn clean(text: &str) -> String {
     }
 }
 
+/// Clef may choose only an intent clearly present in the current utterance.
+/// This small literal guard keeps a mistaken model answer from turning
+/// conversation, quotations, conditionals or compound requests into orders.
+fn explicit_command(text: &str, intent: &str, name: &str) -> bool {
+    if text.contains(['"', '“', '”']) {
+        return false;
+    }
+    let normalized: String = text.to_lowercase().chars()
+        .map(|c| if c.is_alphanumeric() { c } else { ' ' }).collect();
+    let words = normalized.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut command = words.as_str();
+    let name = name.to_lowercase();
+    for _ in 0..4 {
+        let before = command;
+        for prefix in ["hey ", "please ", "can you ", "could you ", "would you "] {
+            if let Some(rest) = command.strip_prefix(prefix) { command = rest; break; }
+        }
+        for address in [name.as_str(), if name == "kevin" { "kev" } else { name.as_str() }] {
+            if let Some(rest) = command.strip_prefix(address).and_then(|s| s.strip_prefix(' ')) {
+                command = rest;
+                break;
+            }
+        }
+        if command == before { break; }
+    }
+    for _ in 0..2 {
+        if let Some(rest) = command.strip_suffix(" please").or_else(|| command.strip_suffix(" now")) {
+            command = rest;
+        }
+    }
+    match intent {
+        "follow" => matches!(command, "follow" | "follow me" | "follow chief" | "follow the chief" | "come with me" | "resume following"),
+        "stay" => matches!(command, "stay" | "stay here" | "hold position" | "hold your position" | "wait here" | "stop moving"),
+        "go_aim" => matches!(command, "go there" | "move there" | "go aim" | "go where i am aiming" | "go where i m aiming" | "move where i am aiming" | "move where i m aiming"),
+        "hold_fire" => matches!(command, "hold fire" | "hold your fire" | "cease fire" | "cease firing" | "stop shooting" | "stop firing" | "do not shoot" | "don t shoot" | "don t fire" | "weapons tight"),
+        "resume_fire" => matches!(command, "resume fire" | "resume firing" | "start shooting" | "start firing" | "fire at will" | "you can shoot" | "you can fire" | "weapons free"),
+        _ => false,
+    }
+}
+
+/// Unknown, malformed and legacy action answers are noncommands.
+fn command_intent(answer: &Value) -> &str {
+    match answer["intent"]["choice"].as_str() {
+        Some(intent @ ("follow" | "stay" | "go_aim" | "hold_fire" | "resume_fire")) => intent,
+        _ => "none",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,42 +1255,92 @@ mod tests {
     }
 
     #[test]
-    fn system_one_still_selects_game_actions_targets_and_whether_to_speak() {
+    fn events_only_ask_about_speech_and_cooldown_skips_all_clef_calls() {
         let server = MockHttp::new(|request, stream| {
             let body = request.json();
-            assert_eq!(body["model"], "clef-flash-artemis");
-            let answers = if body["questions"].get("do").is_some() {
-                assert_eq!(body["questions"]["do"]["type"], "choice");
-                json!({"do": {"choice": "shoot"}})
-            } else if body["questions"].get("which").is_some() {
-                assert_eq!(body["questions"]["which"]["type"], "choice");
-                json!({"which": {"choice": "12"}})
-            } else {
-                assert_eq!(body["questions"]["speak"]["type"], "noul");
-                json!({"speak": {"noul": 0.8}})
-            };
-            reply(
-                stream,
-                200,
-                &[("Content-Type", "application/json")],
-                json!({"answers": answers}).to_string().as_bytes(),
-            );
+            assert_eq!(body["questions"].as_object().unwrap().len(), 1);
+            assert_eq!(body["questions"]["speak"]["type"], "noul");
+            reply(stream, 200, &[("Content-Type", "application/json")],
+                br#"{"answers":{"speak":{"noul":0.8}}}"#);
+        });
+        let dir = TestDir::new();
+        let (mut brain, _, _, _peer) = fixture(&server, &dir);
+        *brain.link.state.lock().unwrap() = json!({"actions": [{"name": "shoot"}]});
+        assert!(brain.decide(false, false).unwrap());
+        server.request();
+        assert!(!brain.decide(false, true).unwrap());
+        assert!(brain.decide(true, false).unwrap());
+        assert!(server.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn explicit_command_guard_refuses_ambiguous_or_misclassified_orders() {
+        for (text, intent) in [("I used to follow Chief", "follow"), ("Maybe stay nearby", "stay"),
+            ("If we move, follow me", "follow"), ("He said \"stay here\"", "stay"),
+            ("Don't follow me", "follow"), ("Hold fire", "stay"),
+            ("Follow me and stop shooting", "follow"), ("Go to that room", "go_aim")] {
+            assert!(!explicit_command(text, intent, "Kevin"), "{text}");
+        }
+        for (text, intent) in [("Kevin, please follow me", "follow"), ("Can you stay here?", "stay"),
+            ("Go there.", "go_aim"), ("Don't shoot", "hold_fire"), ("Kev, fire at will now", "resume_fire")] {
+            assert!(explicit_command(text, intent, "Kevin"), "{text}");
+        }
+    }
+
+    #[test]
+    fn malformed_or_legacy_intents_are_none() {
+        for answer in [Value::Null, json!({"intent":{"choice":"shoot"}}),
+            json!({"intent":{"choice":12}}), json!({"do":{"choice":"follow"}})] {
+            assert_eq!(command_intent(&answer), "none");
+        }
+        for intent in ["none", "follow", "stay", "go_aim", "hold_fire", "resume_fire"] {
+            assert_eq!(command_intent(&json!({"intent":{"choice":intent}})), intent);
+        }
+    }
+
+    #[test]
+    fn ordinary_conversation_makes_one_focused_choice_and_sends_no_order() {
+        let server = MockHttp::new(|request, stream| {
+            let body = request.json();
+            assert_eq!(body["questions"].as_object().unwrap().len(), 1);
+            let criteria = body["questions"]["intent"]["criteria"].as_object().unwrap();
+            assert_eq!(criteria.len(), 6);
+            assert!(criteria.contains_key("none"));
+            assert!(!body["state"].as_str().unwrap().contains("Cover me!"));
+            reply(stream, 200, &[("Content-Type", "application/json")],
+                br#"{"answers":{"intent":{"choice":"none"}}}"#);
         });
         let dir = TestDir::new();
         let (mut brain, _, _, mut peer) = fixture(&server, &dir);
-        *brain.link.state.lock().unwrap() = json!({"actions": [{"name": "shoot", "description": "shoots an enemy", "options": {"12": "grunt ahead"}}]});
-        assert!(brain.decide(false, false).unwrap());
-        assert_eq!(
-            serde_json::from_slice::<Value>(&frame(&mut peer).1).unwrap(),
-            json!({"type": "action", "action": "shoot", "option": "12"})
-        );
-        for _ in 0..3 {
-            server.request();
-        }
-        assert!(!brain.decide(false, true).unwrap()); // speech decision skipped in cooldown
-        server.request();
+        brain.interpret_command("Do you remember home?", Some(123)).unwrap();
         server.request();
         assert!(server.requests.try_recv().is_err());
+        peer.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        use std::io::Read;
+        assert!(peer.read(&mut [0;1]).is_err());
+    }
+
+    #[test]
+    fn command_uses_captured_context_and_waits_for_native_result() {
+        let server = MockHttp::new(|_, stream| reply(stream, 200,
+            &[("Content-Type", "application/json")],
+            br#"{"answers":{"intent":{"choice":"go_aim"}}}"#));
+        let dir = TestDir::new();
+        let (mut brain, _, _, mut peer) = fixture(&server, &dir);
+        let native = std::thread::spawn(move || {
+            let request: Value = serde_json::from_slice(&frame(&mut peer).1).unwrap();
+            assert_eq!(request["action"], "go_aim");
+            assert_eq!(request["context_id"], 71);
+            let result = json!({"type":"command_result", "request_id":request["request_id"],
+                "accepted":false,"text":"Unsafe landing."}).to_string();
+            peer.write_all(&[1]).unwrap();
+            peer.write_all(&(result.len() as u32).to_be_bytes()).unwrap();
+            peer.write_all(result.as_bytes()).unwrap();
+        });
+        brain.interpret_command("Go there.", Some(71)).unwrap();
+        native.join().unwrap();
+        assert!(brain.memory.feed.last().unwrap().contains("Unsafe landing"));
+        assert!(brain.memory.feed.last().unwrap().contains("previous orders retained"));
     }
 
     #[test]

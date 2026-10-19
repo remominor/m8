@@ -179,7 +179,7 @@ pub fn run(
                 Err(e) => tiny_http::Response::from_string(e.to_string()).with_status_code(500),
             },
             ("POST", "/say") => {
-                let _ = inputs.send(Input::Heard(body));
+                let _ = inputs.send(Input::heard(body, &link));
                 tiny_http::Response::from_string("")
             }
             ("POST", "/event") => {

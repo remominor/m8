@@ -8,8 +8,9 @@
 
 use serde_json::{json, Value};
 use std::io::{BufReader, Read, Write};
+use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -44,6 +45,8 @@ pub struct GameLink {
     /// The view last asked for, once it comes.
     view: Arc<(Mutex<Option<View>>, Condvar)>,
     hello: Value,
+    pending: Arc<Mutex<HashMap<u64, Sender<Value>>>>,
+    next_request: Arc<AtomicU64>,
 }
 
 impl GameLink {
@@ -61,6 +64,8 @@ impl GameLink {
             speech_cooldown_ms: Arc::new(AtomicU64::new(5000)),
             view: Arc::new((Mutex::new(None), Condvar::new())),
             hello: Value::Null,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_request: Arc::new(AtomicU64::new(1)),
         };
         let incoming = link.clone();
         std::thread::spawn(move || {
@@ -82,6 +87,8 @@ impl GameLink {
             speech_cooldown_ms: Arc::new(AtomicU64::new(5000)),
             view: Arc::new((Mutex::new(None), Condvar::new())),
             hello,
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            next_request: Arc::new(AtomicU64::new(1)),
         };
 
         let accept_link = link.clone();
@@ -90,6 +97,8 @@ impl GameLink {
                 let _ = stream.set_nodelay(true);
                 let Ok(reader) = stream.try_clone() else { continue };
                 println!("[game] game connected");
+                accept_link.pending.lock().unwrap().clear();
+                *accept_link.state.lock().unwrap() = Value::Null;
                 *accept_link.writer.lock().unwrap() = Some(stream);
                 accept_link.send_json(&accept_link.hello);
 
@@ -117,6 +126,27 @@ impl GameLink {
 
     pub fn send_json(&self, value: &Value) {
         self.send_frame(KIND_JSON, value.to_string().as_bytes());
+    }
+
+    /// A correlated native reply, independent of the brain's event queue. No
+    /// requests are replayed on reconnect; a timeout never means success.
+    pub fn request(&self, mut value: Value, timeout: Duration) -> Option<Value> {
+        if self.writer.lock().unwrap().is_none() {
+            return None;
+        }
+        let id = self.next_request.fetch_add(1, Ordering::Relaxed) % 0x7fff_fffe + 1;
+        value["request_id"] = json!(id);
+        let (sender, receiver) = mpsc::channel();
+        self.pending.lock().unwrap().insert(id, sender);
+        self.send_json(&value);
+        let response = receiver.recv_timeout(timeout).ok();
+        self.pending.lock().unwrap().remove(&id);
+        response
+    }
+
+    pub fn capture_command(&self) -> Option<u64> {
+        self.request(json!({"type": "capture_command"}), Duration::from_millis(500))?
+            ["context_id"].as_u64().filter(|id| *id > 0 && *id <= 0x7fff_ffff)
     }
 
     pub fn send_audio(&self, pcm: &[u8]) {
@@ -184,6 +214,13 @@ impl GameLink {
             }
             let Ok(msg) = serde_json::from_slice::<Value>(&payload) else { continue };
             match msg["type"].as_str() {
+                Some("command_context" | "command_result") => {
+                    if let Some(id) = msg["request_id"].as_u64() {
+                        if let Some(sender) = self.pending.lock().unwrap().remove(&id) {
+                            let _ = sender.send(msg);
+                        }
+                    }
+                }
                 Some("state") => *self.state.lock().unwrap() = msg,
                 Some("settings") => {
                     if let Some(seconds) = msg["speech_cooldown"].as_f64() {
@@ -197,11 +234,59 @@ impl GameLink {
                         println!("[mic] {}", if muted { "muted in the game" } else { "unmuted in the game" });
                     }
                 }
-                Some("event" | "saved" | "loaded" | "direct") => {
+                Some("event" | "saved" | "loaded" | "direct" | "companion_notice") => {
                     let _ = events.send(msg);
                 }
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::frame;
+
+    fn native_reply(peer: &mut TcpStream, reply: Value) {
+        let payload = reply.to_string();
+        peer.write_all(&[KIND_JSON]).unwrap();
+        peer.write_all(&(payload.len() as u32).to_be_bytes()).unwrap();
+        peer.write_all(payload.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn input_capture_is_correlated_before_entering_the_brain_queue() {
+        let (link, mut peer) = GameLink::test_pair();
+        let native = std::thread::spawn(move || {
+            let request: Value = serde_json::from_slice(&frame(&mut peer).1).unwrap();
+            assert_eq!(request["type"], "capture_command");
+            native_reply(&mut peer, json!({"type":"command_context", "request_id":999999,
+                "context_id":99})); // An unrelated reply cannot select the aim snapshot.
+            native_reply(&mut peer, json!({"type":"command_context", "request_id":request["request_id"],
+                "context_id":17,"aim_valid":true}));
+        });
+        match crate::brain::Input::heard("Go there".into(), &link) {
+            crate::brain::Input::Heard { text, context } => {
+                assert_eq!(text, "Go there");
+                assert_eq!(context, Some(17));
+            }
+            _ => panic!("expected player input"),
+        }
+        native.join().unwrap();
+        assert!(link.pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn missing_native_ack_times_out_without_replaying_the_command() {
+        let (link, mut peer) = GameLink::test_pair();
+        let result = link.request(json!({"type":"action","action":"stay","context_id":17}),
+            Duration::from_millis(25));
+        assert!(result.is_none());
+        assert!(link.pending.lock().unwrap().is_empty());
+        let request: Value = serde_json::from_slice(&frame(&mut peer).1).unwrap();
+        assert_eq!(request["action"], "stay");
+        peer.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
+        assert!(peer.read(&mut [0; 1]).is_err());
     }
 }

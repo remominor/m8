@@ -11,14 +11,15 @@ clang 22 or later):
 ```bash
 cd halo
 python configure.py --release
-ninja windows
+ninja linux                      # CachyOS/Linux
+# ninja windows                  # Windows
 ```
 
 ## What the changes add
 
-- `port/linux/game/companion.c`: the teammate's body. He walks (around boulders too), fights,
-  takes cover, throws grenades, gets in vehicles, picks up weapons, and sees the level; each tick
-  the game's state in words and the actions he can take go to m8, and what m8 picks, he does.
+- `port/linux/game/companion.c`: native following, BSP navigation, conservative terrain/jump
+  checks, bounded stuck recovery, visible-enemy acquisition and rifle combat. Movement and fire
+  orders persist independently; Clef interprets explicit commands and decides speech relevance.
 - `port/linux/src/mate_link.c`: the link to m8, and his voice played by the game's own sound:
   placed in the world beside you, muffled behind walls, or over the radio when he's far off.
 - Kevin's eyes: the frame you see, with spots marked on the ground, when m8 asks.
@@ -26,3 +27,6 @@ ninja windows
   distance), the **M** key that mutes the mic (with an icon), and `kevin <text>` at the console.
 - Hooks in the game's sources, each marked `port:`: saves and loads (his memory goes with them),
   the radio and cutscene dialogue he hears, the sound, the path search.
+
+See [Sprint 1 behavior, limitations and gameplay checklist](SPRINT1.md) for command examples,
+diagnostics, automated validation and the pending Pillar of Autumn checks.

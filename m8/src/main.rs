@@ -142,10 +142,10 @@ fn main() -> Result<()> {
             let text = |key: &str| msg[key].as_str().unwrap_or_default().to_string();
             let input = match msg["type"].as_str() {
                 Some("saved") => brain::Input::Saved(text("id")),
+                Some("companion_notice") => brain::Input::Notice(text("text")),
                 Some("loaded") => brain::Input::Loaded(text("id")),
-                // (typed in the game by the player, as a game master's line: what models are
-                // trained to take as out of character, about the world)
-                Some("direct") => brain::Input::Event { text: format!("Game master: {}", text("text")), react: true },
+                // Console speech already carries a native snapshot of the aimed location.
+                Some("direct") => brain::Input::Heard { text: text("text"), context: msg["context_id"].as_u64() },
                 _ => brain::Input::Event { text: text("text"), react: msg["react"].as_bool().unwrap_or(true) },
             };
             let _ = forward.send(input);
@@ -219,9 +219,10 @@ fn main() -> Result<()> {
         let (cfg, heard_tx, link, speaking) = (cfg.clone(), inputs_tx.clone(), link.clone(), speaking.clone());
         std::thread::spawn(move || {
             let (tx, rx) = mpsc::channel::<String>();
+            let command_link = link.clone();
             std::thread::spawn(move || {
                 for text in rx {
-                    let _ = heard_tx.send(brain::Input::Heard(text));
+                    let _ = heard_tx.send(brain::Input::heard(text, &command_link));
                 }
             });
             let mut mic_error_logged = false;
@@ -248,11 +249,12 @@ fn main() -> Result<()> {
     // Typed lines count as speech, handy for testing without a mic.
     let brain_inputs = inputs_tx.clone();
     let typed = inputs_tx;
+    let typed_link = link.clone();
     std::thread::spawn(move || {
         for line in std::io::stdin().lines().map_while(Result::ok) {
             let line = line.trim().to_string();
             if !line.is_empty() {
-                let _ = typed.send(brain::Input::Heard(line));
+                let _ = typed.send(brain::Input::heard(line, &typed_link));
             }
         }
     });

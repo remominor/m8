@@ -69,15 +69,13 @@ const EXAMPLE_STATE = {
   level: "a30",
   in_combat: true,
   state: "Kevin: unhurt, shields full, holding an assault rifle (52 rounds loaded, spare ammo), a pistol on his back (12 rounds loaded, spare ammo), 2 frag and 0 plasma grenades, following {player}. {player}: close by ahead, unhurt, shields full. Enemies: elite close (9 m) ahead, in sight, unhurt, shields full; grunt at mid range (16 m) to the left, in sight, unhurt.",
+  movement_order: "follow", fire_enabled: true,
   actions: [
-    { name: "stay", description: "stays where he is" },
-    { name: "shoot", description: "shoots at an enemy", options: { "1": "elite close (9 m) ahead, in sight, unhurt, shields full", "2": "grunt at mid range (16 m) to the left, in sight, unhurt" } },
-    { name: "rush", description: "rushes an enemy", options: { "1": "elite close (9 m) ahead, in sight, unhurt, shields full", "2": "grunt at mid range (16 m) to the left, in sight, unhurt" } },
-    { name: "cover", description: "takes cover" },
-    { name: "fall_back", description: "falls back" },
-    { name: "frag_grenade", description: "throws a frag grenade", options: { "1": "elite close (9 m) ahead", "2": "grunt at mid range (16 m) to the left" } },
-    { name: "switch_weapon", description: "switches to his pistol" },
-    { name: "crouch", description: "crouches" },
+    { name: "follow", description: "follows Chief" },
+    { name: "stay", description: "holds his current position" },
+    { name: "go_aim", description: "moves to captured, validated ground" },
+    { name: "hold_fire", description: "disables autonomous firing" },
+    { name: "resume_fire", description: "enables autonomous firing" },
   ],
 };
 const byId = id => document.getElementById(id);
@@ -118,6 +116,8 @@ function render(e) {
   if (e.kind === "heard") return `<div class="heard">You: ${esc(d.text)}</div>`;
   if (e.kind === "llm") return `<div class="llm">${d.error ? `LLM failed: ${esc(d.error)}` : `Mate: ${esc(d.line)}`}</div>`;
   if (e.kind === "event") return `<div class="event">Event: ${esc(d.text)}</div>`;
+  if (e.kind === "command") return `<div class="event">Order: ${esc(d.text ?? d.error ?? d.intent ?? "")}</div>`;
+  if (e.kind === "companion") return `<div class="event">Native: ${esc(d.text)}</div>`;
   if (e.kind === "memory") return `<div class="kev">Memory summarised: ${esc(d.summary)}</div>`;
   if (e.kind === "kev") {
     const speak = (d.calls || []).map(c => c.response?.answers?.speak?.noul).find(v => v != null);
