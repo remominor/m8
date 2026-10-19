@@ -92,7 +92,7 @@ function summary(e) {
       else if (d.speak !== null && d.speak !== undefined) s += ` · speak ${d.speak ? (d.waiting ? "yes, too soon: let go" : "yes") : "no"} (${(speakScore(d) ?? 0).toFixed(2)})`;
       return s;
     }
-    case "llm": return d.line ?? text(d);
+    case "llm": return d.error ? `FAILED: ${d.error}` : d.line ?? text(d);
     case "voice": return `"${d.text}"` + (d.first_audio_ms != null ? ` · first audio ${d.first_audio_ms} ms` : "") + (d.error ? " · FAILED" : "");
     case "summary": return d.output ?? d.error ?? "";
     case "memory": return `folded ${d.folded} lines into the summary`;
@@ -188,6 +188,7 @@ function llm(d) {
     <span>first words <b>${d.first_token_ms ?? "?"} ms</b></span><span>total <b>${d.ms} ms</b></span>
     ${d.cut_off ? `<span style="color:var(--mate)">cut off (talked over)</span>` : ""}</div>`;
   const directions = d.directions || (d.how ? [d.how] : []);
+  if (d.error) h += `<h2>Request failed</h2>` + box(pre(d.error));
   h += `<h2>What he said</h2>` + box(`<div class="said" style="white-space:pre-wrap">${esc(d.line)}</div><div class="meta" style="margin-top:4px">voice directions, each for what follows it: <b>${
     directions.length ? directions.map(esc).join(" → ") : "(none)"}</b></div>`);
   h += `<h2>Raw output (exactly as the model wrote it)</h2>` + box(pre(d.output));

@@ -14,6 +14,8 @@ mod listen;
 mod picture;
 mod site;
 mod speak;
+#[cfg(test)]
+mod test_support;
 
 use anyhow::Result;
 use config::Config;
@@ -200,7 +202,7 @@ fn main() -> Result<()> {
             }
         });
     }
-    println!("Brain page: http://127.0.0.1:{}", site::PORT);
+    println!("Brain page: http://127.0.0.1:{} (LAN: http://<host-ip>:{}, listening on 0.0.0.0)", site::PORT, site::PORT);
 
     let speaking = Speaking::new();
     let (speech_tx, speech_rx) = mpsc::channel();
@@ -222,8 +224,23 @@ fn main() -> Result<()> {
                     let _ = heard_tx.send(brain::Input::Heard(text));
                 }
             });
-            if let Err(e) = listen::run(cfg, transcriber, speaking, link, tx) {
-                eprintln!("[mic] stopped: {e:#}");
+            let mut mic_error_logged = false;
+            loop {
+                match listen::run(
+                    cfg.clone(), transcriber.clone(), speaking.clone(), link.clone(), tx.clone(),
+                    || mic_error_logged = false,
+                ) {
+                    Ok(()) => break,
+                    Err(e) => {
+                        if !mic_error_logged {
+                            eprintln!("[mic] default input unavailable: {e:#}; retrying quietly every 2 seconds");
+                            mic_error_logged = true;
+                        }
+                    }
+                }
+                // A disconnected mic must not permanently disable hearing. Reopen the desktop
+                // default after hotplug; never pin a particular sound card or external mic.
+                std::thread::sleep(Duration::from_secs(2));
             }
         });
     }

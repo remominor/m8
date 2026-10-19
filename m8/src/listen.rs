@@ -84,6 +84,47 @@ pub fn wav(samples: &[f32], rate: u32) -> Vec<u8> {
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+
+    #[test]
+    fn parakeet_multipart_contains_model_and_mono_16k_pcm16_wav() {
+        let server = MockHttp::new(|_, stream| {
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                br#"{"text":"  Cover me!  "}"#,
+            )
+        });
+        let mut cfg = config();
+        cfg.stt.url = format!("{}/v1/audio/transcriptions", server.url);
+        let samples = [-1.0, 0.0, 1.0];
+        assert_eq!(
+            Transcriber::new(&cfg).transcribe(&samples).unwrap(),
+            "Cover me!"
+        );
+        let request = server.request();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/audio/transcriptions");
+        assert!(request.headers["content-type"].starts_with("multipart/form-data; boundary="));
+        let body = String::from_utf8_lossy(&request.body);
+        assert!(body.contains("name=\"model\"\r\n\r\nparakeet\r\n"));
+        assert!(body.contains("name=\"file\"; filename=\"speech.wav\"\r\nContent-Type: audio/wav"));
+        assert!(!body.contains("diarization"));
+        let start = request.body.windows(4).position(|p| p == b"RIFF").unwrap();
+        let wave = &request.body[start..start + 50];
+        assert_eq!(&wave[8..16], b"WAVEfmt ");
+        assert_eq!(u16::from_le_bytes(wave[20..22].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(wave[22..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(wave[24..28].try_into().unwrap()), 16000);
+        assert_eq!(u16::from_le_bytes(wave[34..36].try_into().unwrap()), 16);
+        assert_eq!(&wave[44..], &[1, 128, 0, 0, 255, 127]);
+    }
+}
+
 fn create_vad(cfg: &Config) -> Result<VoiceActivityDetector> {
     let mut vc = VadModelConfig::default();
     vc.silero_vad.model = Some(path_str(&cfg.models.silero_vad));
@@ -246,11 +287,19 @@ impl Listener {
 ///
 /// With barge-in on, the mic stays live while the mate talks: as soon as the player starts
 /// speaking, the mate is cut off (queued audio in the game, pending TTS and the LLM reply).
-pub fn run(cfg: Config, transcriber: Transcriber, speaking: Speaking, link: GameLink, out: Sender<String>) -> Result<()> {
+/// Opens the desktop default (ALSA's PipeWire bridge on CachyOS), leaving device selection
+/// and live default-device changes to KDE/WirePlumber. Errors return to main's reconnect loop.
+pub fn run(
+    cfg: Config, transcriber: Transcriber, speaking: Speaking, link: GameLink,
+    out: Sender<String>, on_ready: impl FnOnce(),
+) -> Result<()> {
     let host = cpal::default_host();
     let device = host.default_input_device().ok_or_else(|| anyhow!("no microphone found"))?;
     let supported = device.default_input_config()?;
     let mic_rate = supported.sample_rate().0 as i32;
+    let (tx, rx) = mpsc::channel::<MicChunk>();
+    let stream = build_input_stream(&device, &supported, tx)?;
+    stream.play()?;
     println!(
         "[mic] using '{}' at {} Hz, {} channel(s), {:?}",
         device.name().unwrap_or_default(),
@@ -259,14 +308,13 @@ pub fn run(cfg: Config, transcriber: Transcriber, speaking: Speaking, link: Game
         supported.sample_format()
     );
 
-    let (tx, rx) = mpsc::channel::<Vec<f32>>();
-    let stream = build_input_stream(&device, &supported, tx)?;
-    stream.play()?;
-
     let (barge_in, mute_while_speaking) = (cfg.mic.barge_in, cfg.mic.mute_while_speaking);
     let name = cfg.mate.name.clone();
     let mut listener = Listener::new(cfg, transcriber, mic_rate)?;
+    // Let the reconnect loop reset its one-error-per-outage log suppression.
+    on_ready();
     for chunk in rx {
+        let chunk = chunk.map_err(|e| anyhow!("microphone stream failed: {e}"))?;
         let mate_talking = speaking.is_speaking();
         // (muted in the game: nothing heard, and he isn't cut off; the listener starts over,
         // without counting the sound as talked over him)
@@ -299,14 +347,19 @@ fn level_db(samples: &[f32]) -> (f32, f32) {
     (db(peak), db(rms))
 }
 
+type MicChunk = std::result::Result<Vec<f32>, cpal::StreamError>;
+
 fn build_input_stream(
     device: &cpal::Device,
     supported: &cpal::SupportedStreamConfig,
-    tx: Sender<Vec<f32>>,
+    tx: Sender<MicChunk>,
 ) -> Result<cpal::Stream> {
     let config = supported.config();
     let channels = config.channels as usize;
-    let err_fn = |err| eprintln!("[mic] stream error: {err:?}");
+    let errors = tx.clone();
+    let err_fn = move |err| {
+        let _ = errors.send(Err(err));
+    };
 
     fn to_mono<T: Copy>(data: &[T], channels: usize, conv: impl Fn(T) -> f32) -> Vec<f32> {
         data.chunks(channels)
@@ -318,7 +371,7 @@ fn build_input_stream(
         SampleFormat::F32 => device.build_input_stream(
             &config,
             move |data: &[f32], _| {
-                let _ = tx.send(to_mono(data, channels, |s| s));
+                let _ = tx.send(Ok(to_mono(data, channels, |s| s)));
             },
             err_fn,
             None,
@@ -326,7 +379,7 @@ fn build_input_stream(
         SampleFormat::I16 => device.build_input_stream(
             &config,
             move |data: &[i16], _| {
-                let _ = tx.send(to_mono(data, channels, |s| s as f32 / i16::MAX as f32));
+                let _ = tx.send(Ok(to_mono(data, channels, |s| s as f32 / i16::MAX as f32)));
             },
             err_fn,
             None,

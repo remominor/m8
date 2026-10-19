@@ -272,6 +272,7 @@ impl Brain {
         }
         self.summarizing = true;
         let (agent, url, name) = (self.agent.clone(), self.cfg.llm.url.clone(), self.cfg.mate.name.clone());
+        let model = self.cfg.llm.model.clone();
         let (previous, lines) = (self.memory.summary.clone(), self.memory.feed[..folded].join("\n"));
         let (inputs, memory, trace) = (self.inputs.clone(), self.memory_generation, self.trace.clone());
         let temperature = 0.3;
@@ -286,7 +287,7 @@ impl Brain {
             let messages = json!([{"role": "user", "content": request}]);
             let reply: Result<Value> = agent
                 .post(&url)
-                .send_json(json!({"messages": messages, "temperature": temperature}))
+                .send_json(json!({"model": model, "messages": messages, "temperature": temperature}))
                 .map_err(anyhow::Error::from)
                 .and_then(|r| Ok(r.into_json()?));
             let output = reply.as_ref().ok().and_then(|r| r["choices"][0]["message"]["content"].as_str()).map(str::to_string);
@@ -584,6 +585,7 @@ impl Brain {
         let newest = self.memory.feed[self.memory.feed.len().saturating_sub(12)..].join("\n");
         let question = format!("{}\n\nWhat's been happening, newest last:\n{newest}\n\n{question}", self.right_now());
         let mut request = json!({
+            "model": self.cfg.llm.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": ""}],
             "temperature": self.cfg.llm.temperature,
             "stream": false,
@@ -648,7 +650,7 @@ impl Brain {
     /// Asks Kev the questions about `input`; the call, what went in and came out, goes in `calls`.
     fn kev(&self, purpose: &str, input: &str, questions: &Value, calls: &mut Vec<Value>) -> Result<Value> {
         let start = Instant::now();
-        let request = json!({"model": "kev-latest", "state": input, "questions": questions});
+        let request = json!({"model": self.cfg.kev.model, "state": input, "questions": questions});
         let resp: Value = self.agent.post(&self.cfg.kev.url).send_json(&request)?.into_json()?;
         calls.push(json!({
             "purpose": purpose,
@@ -667,8 +669,27 @@ impl Brain {
         let messages = self.messages();
         let start = Instant::now();
         let generation = self.speaking.generation();
-        let request = json!({"messages": messages, "temperature": self.cfg.llm.temperature, "stream": true});
-        let resp = self.agent.post(&self.cfg.llm.url).send_json(&request)?;
+        let request = json!({"model": self.cfg.llm.model, "messages": messages, "temperature": self.cfg.llm.temperature, "stream": true});
+        let resp = self.agent.post(&self.cfg.llm.url).send_json(&request).map_err(|e| {
+            let detail = match e {
+                ureq::Error::Status(code, response) => format!("HTTP {code}: {}", response.into_string().unwrap_or_default()),
+                other => other.to_string(),
+            };
+            let error = format!("LLM at {} (model {:?}): {detail}", self.cfg.llm.url, self.cfg.llm.model);
+            self.trace.add("llm", json!({
+                "url": self.cfg.llm.url,
+                "model": self.cfg.llm.model,
+                "request": request,
+                "output": "",
+                "line": "",
+                "directions": [],
+                "first_token_ms": null,
+                "ms": start.elapsed().as_millis() as u64,
+                "cut_off": self.speaking.generation() != generation,
+                "error": error,
+            }));
+            anyhow::anyhow!(error)
+        })?;
         // (he's talking from here until speak.rs has voiced the End below: always sent)
         self.speaking.begin_line();
         let mut failed = None;
@@ -887,5 +908,325 @@ fn clean(text: &str) -> String {
         trimmed.to_string()
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::*;
+    use std::io::Write;
+    use std::net::TcpStream;
+    use std::sync::mpsc;
+
+    fn fixture(
+        server: &MockHttp,
+        dir: &TestDir,
+    ) -> (Brain, Receiver<SpeechJob>, Receiver<Input>, TcpStream) {
+        let mut cfg = config();
+        cfg.base_dir = dir.0.clone();
+        cfg.mate.persona = None;
+        cfg.llm.url = format!("{}/v1/chat/completions", server.url);
+        cfg.kev.url = format!("{}/v1/systemone", server.url);
+        let (link, peer) = GameLink::test_pair();
+        let (speech, jobs) = mpsc::channel();
+        let (inputs, results) = mpsc::channel();
+        let prompt = PromptFile::load(dir.0.join("system_prompt.txt")).unwrap();
+        let mut brain = Brain::new(
+            cfg,
+            link,
+            speech,
+            Speaking::new(),
+            Trace::new(&dir.0),
+            prompt.clone(),
+            prompt.clone(),
+            prompt,
+            inputs,
+        );
+        brain.memory.feed.push("Player: Cover me!".into());
+        (brain, jobs, results, peer)
+    }
+
+    #[test]
+    fn streamed_dialogue_routes_model_and_carries_notes_to_saved_profile_tts() {
+        let server = MockHttp::new(|request, stream| {
+            if request.path == "/v1/audio/speech" {
+                reply(stream, 200, PCM_HEADERS, &[0, 0]);
+                return;
+            }
+            let mut sse = String::new();
+            for delta in [
+                "[yell",
+                "ing over gunfire]Cover me! I'm moving! ",
+                "[quietly]Stay low. ",
+                "[]Okay. (nods) (laughs)",
+            ] {
+                sse.push_str(&format!("data: {}\n\n", json!({"model": "gemma4-12b-mtp-vision", "choices": [{"delta": {"content": delta}}]})));
+            }
+            sse.push_str("data: [DONE]\n\n");
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "text/event-stream")],
+                sse.as_bytes(),
+            );
+        });
+        let dir = TestDir::new();
+        let (mut brain, jobs, _, _peer) = fixture(&server, &dir);
+        brain.say().unwrap();
+        let request = server.request();
+        assert_eq!(request.path, "/v1/chat/completions");
+        assert_eq!(request.json()["model"], "gemma4-12b-mtp-vision");
+        assert_eq!(request.json()["stream"], true);
+        let mut cfg = brain.cfg.clone();
+        cfg.mate.voice_server = server.url.clone();
+        let voice = crate::speak::Voice::load(&cfg).unwrap();
+        let mut sentences = Vec::new();
+        let mut ended = false;
+        for job in jobs.try_iter() {
+            match job {
+                SpeechJob::Sentence(text, how, generation) => {
+                    assert_eq!(generation, 0);
+                    voice.stream(&text, &how, || true, |_| true).unwrap();
+                    let body = server.request().json();
+                    assert_eq!(
+                        body["guidance_scale"],
+                        if how.is_empty() { 1.0 } else { 4.0 }
+                    );
+                    if how.is_empty() {
+                        assert!(body.get("instructions").is_none());
+                    } else {
+                        assert_eq!(body["instructions"], how);
+                    }
+                    sentences.push((text, how));
+                }
+                SpeechJob::End(0) => ended = true,
+                _ => panic!("wrong generation"),
+            }
+        }
+        assert!(ended);
+        assert_eq!(
+            sentences,
+            [
+                ("Cover me!".into(), "yelling over gunfire".into()),
+                ("I'm moving!".into(), "yelling over gunfire".into()),
+                ("Stay low.".into(), "quietly".into()),
+                ("Okay.".into(), "".into()),
+                ("(laugh)".into(), "".into()),
+            ]
+        );
+        let entry: Value = serde_json::from_str(
+            std::fs::read_to_string(
+                std::fs::read_dir(&dir.0)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(entry["data"]["first_token_ms"].is_number());
+    }
+
+    #[test]
+    fn rejected_dialogue_requests_are_recorded_with_router_error() {
+        let server = MockHttp::new(|_, stream| reply(stream, 404, &[("Content-Type", "application/json")], br#"{"error":{"message":"no router for requested model"}}"#));
+        let dir = TestDir::new();
+        let (mut brain, jobs, _, _peer) = fixture(&server, &dir);
+        let error = brain.say().unwrap_err();
+        assert!(error.to_string().contains("HTTP 404"));
+        assert!(error.to_string().contains("no router for requested model"));
+        assert!(jobs.try_recv().is_err());
+        assert!(brain.speaking.quiet_from().is_some());
+        let log = std::fs::read_dir(&dir.0).unwrap().next().unwrap().unwrap().path();
+        let entry: Value = serde_json::from_str(std::fs::read_to_string(log).unwrap().lines().last().unwrap()).unwrap();
+        assert_eq!(entry["kind"], "llm");
+        assert!(entry["data"]["error"].as_str().unwrap().contains("no router for requested model"));
+        assert_eq!(entry["data"]["request"]["model"], "gemma4-12b-mtp-vision");
+    }
+
+    #[test]
+    fn vision_description_and_schema_spot_selection_route_model() {
+        let server = MockHttp::new(|request, stream| {
+            let content = if request.json().get("response_format").is_some() {
+                r#"{"place":"cover","spot":7}"#
+            } else {
+                "A wall ahead."
+            };
+            let body = json!({"choices": [{"message": {"content": content}}]}).to_string();
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                body.as_bytes(),
+            );
+        });
+        for kind in ["describe", "choose"] {
+            let dir = TestDir::new();
+            let (mut brain, _, _, mut peer) = fixture(&server, &dir);
+            let game = std::thread::spawn(move || {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&frame(&mut peer).1).unwrap()["type"],
+                    "view"
+                );
+                let about = json!({"width": 2, "height": 2, "spots": [{"id": 7, "x": 0.5, "y": 0.5, "metres": 3}]}).to_string();
+                let mut payload = (about.len() as u16).to_be_bytes().to_vec();
+                payload.extend(about.as_bytes());
+                payload.extend([80; 12]);
+                peer.write_all(&[4]).unwrap();
+                peer.write_all(&(payload.len() as u32).to_be_bytes())
+                    .unwrap();
+                peer.write_all(&payload).unwrap();
+                if kind == "choose" {
+                    let (frame_kind, body) = frame(&mut peer);
+                    assert_eq!(frame_kind, 1);
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&body).unwrap()["option"],
+                        "7"
+                    );
+                }
+            });
+            let mut action = json!({"type": "action", "action": "go_to"});
+            let (seen, _) = brain.look(kind, &mut action).unwrap();
+            assert!(seen.contains(if kind == "choose" { "cover" } else { "wall" }));
+            game.join().unwrap();
+            let body = server.request().json();
+            assert_eq!(body["model"], "gemma4-12b-mtp-vision");
+            assert_eq!(body["stream"], false);
+            assert!(body["messages"][1]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,"));
+            if kind == "choose" {
+                assert_eq!(body["response_format"]["type"], "json_schema");
+                assert_eq!(
+                    body["response_format"]["json_schema"]["schema"]["properties"]["spot"]["enum"],
+                    json!([0, 7])
+                );
+            } else {
+                assert!(body.get("response_format").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn memory_summary_routes_configured_model_on_background_thread() {
+        let server = MockHttp::new(|_, stream| {
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                br#"{"choices":[{"message":{"content":"Kevin reached cover."}}]}"#,
+            );
+        });
+        let dir = TestDir::new();
+        let (mut brain, _, results, _peer) = fixture(&server, &dir);
+        brain.cfg.llm.model = "custom-gemma-route".into();
+        brain.memory.feed = vec!["A long story. ".repeat(FEED_TOKENS)];
+        brain.fold_over(FEED_TOKENS);
+        match results.recv_timeout(Duration::from_secs(3)).unwrap() {
+            Input::Summary {
+                text,
+                folded,
+                memory,
+            } => {
+                assert_eq!(text, "Kevin reached cover.");
+                assert_eq!(folded, 1);
+                assert_eq!(memory, 0);
+            }
+            _ => panic!("expected summary"),
+        }
+        let body = server.request().json();
+        assert_eq!(body["model"], "custom-gemma-route");
+        assert_eq!(body["temperature"], 0.3);
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("at most 250 words"));
+    }
+
+    #[test]
+    fn system_one_preserves_questions_and_answers_with_configured_model() {
+        let answers = json!({"speak": {"noul": 0.8}, "do": {"choice": "follow"}});
+        let response = json!({"answers": answers}).to_string();
+        let server = MockHttp::new(move |_, stream| {
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                response.as_bytes(),
+            )
+        });
+        let dir = TestDir::new();
+        let (mut brain, _, _, _peer) = fixture(&server, &dir);
+        let questions = json!({
+            "speak": {"type": "noul", "instructions": "Should Kevin speak now?"},
+            "do": {"type": "choice", "instructions": "What does Kevin do?", "criteria": {"follow": "Kevin follows", "shoot": "Kevin shoots"}}
+        });
+        for model in ["clef-flash-artemis", "custom-clef-route"] {
+            brain.cfg.kev.model = model.into();
+            let result = brain
+                .kev("test", "Player needs cover", &questions, &mut Vec::new())
+                .unwrap();
+            assert_eq!(result, answers);
+            let request = server.request();
+            assert_eq!(request.path, "/v1/systemone");
+            assert_eq!(
+                request.json(),
+                json!({"model": model, "state": "Player needs cover", "questions": questions})
+            );
+        }
+    }
+
+    #[test]
+    fn system_one_still_selects_game_actions_targets_and_whether_to_speak() {
+        let server = MockHttp::new(|request, stream| {
+            let body = request.json();
+            assert_eq!(body["model"], "clef-flash-artemis");
+            let answers = if body["questions"].get("do").is_some() {
+                assert_eq!(body["questions"]["do"]["type"], "choice");
+                json!({"do": {"choice": "shoot"}})
+            } else if body["questions"].get("which").is_some() {
+                assert_eq!(body["questions"]["which"]["type"], "choice");
+                json!({"which": {"choice": "12"}})
+            } else {
+                assert_eq!(body["questions"]["speak"]["type"], "noul");
+                json!({"speak": {"noul": 0.8}})
+            };
+            reply(
+                stream,
+                200,
+                &[("Content-Type", "application/json")],
+                json!({"answers": answers}).to_string().as_bytes(),
+            );
+        });
+        let dir = TestDir::new();
+        let (mut brain, _, _, mut peer) = fixture(&server, &dir);
+        *brain.link.state.lock().unwrap() = json!({"actions": [{"name": "shoot", "description": "shoots an enemy", "options": {"12": "grunt ahead"}}]});
+        assert!(brain.decide(false, false).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frame(&mut peer).1).unwrap(),
+            json!({"type": "action", "action": "shoot", "option": "12"})
+        );
+        for _ in 0..3 {
+            server.request();
+        }
+        assert!(!brain.decide(false, true).unwrap()); // speech decision skipped in cooldown
+        server.request();
+        server.request();
+        assert!(server.requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn supported_sounds_and_stage_directions_remain_unchanged() {
+        assert_eq!(
+            clean("(nods) Ready. (sighs) (laughing) (coughs) (clears his throat)"),
+            "Ready. (sigh) (laugh) (cough) (clears throat)"
+        );
     }
 }

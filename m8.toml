@@ -5,12 +5,13 @@
 name = "Kevin"
 # The persona: its prompts and level stories (examples/kevin is Kevin, the Halo CE teammate).
 persona = "examples/kevin"
-# The voice: a server with Breeze TTS 2's API (start-breeze.ps1), cloning this WAV (its
-# transcript is the .txt beside it), told how to say each line.
-voice_server = "http://127.0.0.1:7860"
-voice_reference = "voices/soldier.wav"
+# Breeze base URL and existing saved profile (no local reference WAV or transcript).
+voice_server = "https://tts.remominor.com"
+voice = "soldier"
+voice_sample_rate = 24000
 # Fixed noise seed, so every line comes out in the same voice.
 voice_seed = 42
+voice_guidance_scale = 2.0
 
 [mic]
 # Talk over the mate to cut it off (use headphones, or it can hear itself through speakers).
@@ -25,17 +26,19 @@ end_of_speech_silence = 0.1
 save_recordings = false
 
 [stt]
-# Speech to text: an OpenAI-style /v1/audio/transcriptions (start-stt.ps1 runs Parakeet behind
-# one). `model = "..."` is sent along, for servers that want one.
-url = "http://127.0.0.1:8083/v1/audio/transcriptions"
+# Parakeet Unified: complete OpenAI-style transcription URL.
+url = "https://stt.remominor.com/v1/audio/transcriptions"
+model = "parakeet"
 
 [kev]
-# The decision model: llama.cpp's /v1/systemone (start-kev.ps1).
-url = "http://127.0.0.1:8080/v1/systemone"
+# Clef System One via Unraid llama-swap: complete URL.
+url = "https://llama.remominor.com/v1/systemone"
+model = "clef-flash-artemis"
 
 [llm]
-# The LLM: an OpenAI-style /v1/chat/completions (start-chat.ps1).
-url = "http://127.0.0.1:8081/v1/chat/completions"
+# Gemma dialogue and vision via local llama-swap: complete URL.
+url = "https://llm.remominor.com/v1/chat/completions"
+model = "g4-12b-mtp-vision-it"
 temperature = 1.0
 
 [models]

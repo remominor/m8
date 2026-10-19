@@ -116,7 +116,7 @@ byId("event").onkeydown = e => { if (e.key === "Enter") sendEvent(byId("event").
 function render(e) {
   const d = e.data;
   if (e.kind === "heard") return `<div class="heard">You: ${esc(d.text)}</div>`;
-  if (e.kind === "llm") return `<div class="llm">Mate: ${esc(d.line)}</div>`;
+  if (e.kind === "llm") return `<div class="llm">${d.error ? `LLM failed: ${esc(d.error)}` : `Mate: ${esc(d.line)}`}</div>`;
   if (e.kind === "event") return `<div class="event">Event: ${esc(d.text)}</div>`;
   if (e.kind === "memory") return `<div class="kev">Memory summarised: ${esc(d.summary)}</div>`;
   if (e.kind === "kev") {

@@ -47,6 +47,30 @@ pub struct GameLink {
 }
 
 impl GameLink {
+    #[cfg(test)]
+    pub(crate) fn test_pair() -> (Self, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let (writer, _) = listener.accept().unwrap();
+        let reader = writer.try_clone().unwrap();
+        let link = Self {
+            writer: Arc::new(Mutex::new(Some(writer))),
+            state: Arc::new(Mutex::new(Value::Null)),
+            mic_muted: Arc::new(AtomicBool::new(false)),
+            speech_cooldown_ms: Arc::new(AtomicU64::new(5000)),
+            view: Arc::new((Mutex::new(None), Condvar::new())),
+            hello: Value::Null,
+        };
+        let incoming = link.clone();
+        std::thread::spawn(move || {
+            let (events, _) = std::sync::mpsc::channel();
+            let (hearing, _) = std::sync::mpsc::channel();
+            incoming.read_loop(reader, events, hearing);
+        });
+        (link, peer)
+    }
+
     /// Starts accepting connections in the background. The game's events, saves and loads go to
     /// `events`, dialogue it played to `hearing`.
     pub fn start(port: u16, hello: Value, events: Sender<Value>, hearing: Sender<Heard>) -> anyhow::Result<Self> {

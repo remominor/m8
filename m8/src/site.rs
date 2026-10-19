@@ -1,4 +1,4 @@
-//! A local page (http://127.0.0.1:8090) to watch and poke the brain: the exact prompt the LLM
+//! A LAN-accessible page (port 8090) to watch and poke the brain: the exact prompt the LLM
 //! and Kev get, every Kev answer, LLM line and action, a box to talk to the mate, and buttons
 //! that send game events, and the system and combat prompts to edit. Its "state" box stands in
 //! for the game when none is connected. /history goes through a session entry by entry, each
@@ -127,7 +127,7 @@ pub fn run(
     link: GameLink,
     inputs: Sender<Input>,
 ) -> anyhow::Result<()> {
-    let server = tiny_http::Server::http(("127.0.0.1", PORT)).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let server = tiny_http::Server::http(("0.0.0.0", PORT)).map_err(|e| anyhow::anyhow!("{e}"))?;
     for mut request in server.incoming_requests() {
         let mut body = String::new();
         let _ = request.as_reader().read_to_string(&mut body);
