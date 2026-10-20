@@ -1761,10 +1761,10 @@ index def58c7fbe4393450aaf5408ea57484347bdd493..f0bfa6566835845347c96ff26d251eba
  | `debug.menu_open` | `""` | `HALO_MENU_OPEN` | Start on this screen of the menus (`main_menu/settings_select/...`, as `port/assets/menus` names it), a player profile being edited, to look at it. |
 diff --git a/port/linux/game/companion.c b/port/linux/game/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..6846717b23bfe92b59069b5ee983fc2ca986da59
+index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2ddec5ce7
 --- /dev/null
 +++ b/port/linux/game/companion.c
-@@ -0,0 +1,4472 @@
+@@ -0,0 +1,4532 @@
 +/*
 +COMPANION.C
 +
@@ -1875,8 +1875,6 @@ index 0000000000000000000000000000000000000000..6846717b23bfe92b59069b5ee983fc2c
 +	/* his bursts: the trigger held, then let go */
 +	COMPANION_BURST_ON_TICKS = 18,
 +	COMPANION_BURST_OFF_TICKS = 9,
-+	/* how long he strafes one way while fighting */
-+	COMPANION_STRAFE_TICKS = 45,
 +	COMPANION_MAXIMUM_ENEMIES = 12,
 +	/* the weapons and vehicles near him he is told of */
 +	COMPANION_MAXIMUM_THINGS = 6,
@@ -2073,8 +2071,7 @@ index 0000000000000000000000000000000000000000..6846717b23bfe92b59069b5ee983fc2c
 +	long path_time;
 +	real_vector3d aim;
 +	long burst_time;
-+	long strafe_time;
-+	real strafe_sign;
++	boolean combat_engaging;
 +	boolean crouch;
 +	/* the Chief told him to stop fighting: no target, no shooting */
 +	boolean hold_fire;
@@ -2319,7 +2316,6 @@ index 0000000000000000000000000000000000000000..6846717b23bfe92b59069b5ee983fc2c
 +	companion_body.order = _companion_order_follow;
 +	companion_body.target_unit_index = NONE;
 +	companion_body.aim = unit_get(unit_index)->object.forward;
-+	companion_body.strafe_sign = 1.f;
 +	companion_body.pace = 1.f;
 +	companion_body.player_moving_since = NONE;
 +	companion_body.act_target_unit_index = NONE;
@@ -4204,7 +4200,68 @@ index 0000000000000000000000000000000000000000..6846717b23bfe92b59069b5ee983fc2c
 +	return failures <= 1 ? TICKS_PER_SECOND : failures == 2 ? 2 * TICKS_PER_SECOND : 5 * TICKS_PER_SECOND;
 +}
 +
-+/* the direction to walk this tick (zero: stand), along his path */
++/* Marines use a path to a firing position instead of walking directly at a
++target. Kevin has no actor firing-position state, so choose a conservative
++standoff point and feed it through his existing validated path navigation. */
++static boolean companion_combat_goal(long unit_index, long player_unit_index,
++	struct companion_enemy const *target, real_point3d *goal)
++{
++	real_point3d origin;
++	real_point3d player_origin;
++	long now = game_time_get();
++	real leash = 75.f / COMPANION_METRES_PER_UNIT;
++	boolean active = companion_body.order == _companion_order_follow &&
++		!companion_body.hold_fire && target && target->visible && companion_body.combat.supported;
++
++	if (!active && !companion_body.combat_engaging) return FALSE;
++	object_get_origin(unit_index, &origin);
++	object_get_origin(player_unit_index, &player_origin);
++	active = active && distance3d(&origin, &player_origin) <= leash;
++	if (active != companion_body.combat_engaging)
++	{
++		/* Never reuse a follow route for enemy approach, or let an old
++		obstruction budget block the resumed follow order. */
++		companion_body.combat_engaging = active;
++		companion_body.path_valid = companion_body.goal_valid = companion_body.goal_dirty = FALSE;
++		companion_body.using_alternative = companion_body.requested_move = FALSE;
++		companion_body.failures = companion_body.recovery = 0;
++		companion_body.stalled_since = 0;
++		companion_body.progress_time = now;
++		companion_body.next_path_time = MAX(now, companion_body.path_time + COMPANION_PATH_TICKS);
++		companion_safety_invalidate();
++	}
++	if (!active) return FALSE;
++	companion_body.pace = 1.f;
++	{
++		real_vector3d toward;
++		real target_distance;
++		real preferred;
++
++		vector_from_points3d(&target->aim_point, &origin, &toward);
++		toward.k = 0.f;
++		target_distance = normalize3d(&toward);
++		preferred = MAX(companion_body.combat.minimum + 0.5f,
++			MIN(companion_body.combat.range * 0.72f, companion_body.combat.range - 0.5f));
++		if (target_distance <= preferred || target_distance < 0.01f)
++		{
++			*goal = origin;
++			return TRUE;
++		}
++		/* toward points from target to Kevin; stop inside weapon range on his
++		current side, then keep the entire movement order within the Chief leash. */
++		point_from_line3d(&target->aim_point, &toward, preferred, goal);
++		if (distance3d(goal, &player_origin) > leash)
++		{
++			real_vector3d from_player;
++			vector_from_points3d(&player_origin, goal, &from_player);
++			if (normalize3d(&from_player) > 0.001f)
++				point_from_line3d(&player_origin, &from_player, leash - 0.1f, goal);
++		}
++	}
++	return TRUE;
++}
++
++/* The direction to walk this tick (zero: stand), along his path. */
 +static void companion_walk_direction(
 +	long unit_index,
 +	long player_unit_index,
@@ -4254,7 +4311,10 @@ index 0000000000000000000000000000000000000000..6846717b23bfe92b59069b5ee983fc2c
 +		companion_body.requested_move = FALSE;
 +		return;
 +	}
-+	wanted = companion_goal(unit_index, player_unit_index, target, &goal);
++	if (companion_combat_goal(unit_index, player_unit_index, target, &goal))
++		wanted = distance3d(&origin, &goal) > 0.2f;
++	else
++		wanted = companion_goal(unit_index, player_unit_index, target, &goal);
 +	if (!wanted)
 +	{
 +		companion_body.requested_move = FALSE;
@@ -7367,10 +7427,10 @@ index be0bf6fc138d9c7bfbea6c9a7e2144901bbe46e9..754a6c1adeb8a01ed927778cb2c80eaa
      lines.append(art.port_picture("blank", [
 diff --git a/tools/harness/tests/companion.c b/tools/harness/tests/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..9ac8596b550c910f0de738cd0166281d1a913779
+index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa40af65c6
 --- /dev/null
 +++ b/tools/harness/tests/companion.c
-@@ -0,0 +1,483 @@
+@@ -0,0 +1,564 @@
 +#include "harness.h"
 +#include <math.h>
 +#define TICKS_PER_SECOND 30
@@ -7380,6 +7440,7 @@ index 0000000000000000000000000000000000000000..9ac8596b550c910f0de738cd0166281d
 +#define companion_notice(a) ((void)0)
 +#define platform_log(...) ((void)0)
 +#define COMPANION_PATH_TICKS 15
++#define COMPANION_METRES_PER_UNIT 3.048f
 +#define MAXIMUM_SMOOTHED_PATH_STEPS 4
 +#define COMPANION_PATHFINDING_RADIUS 0.3f
 +#define COMPANION_OBSTACLE_REACH 16.f
@@ -7522,6 +7583,86 @@ index 0000000000000000000000000000000000000000..9ac8596b550c910f0de738cd0166281d
 + bodies[0].biped.support_surface_index=1;bodies[0].object.parent_object_index=NONE;bodies[0].biped.jump_recovery_timer=10;
 + bodies[1].biped.support_surface_index=1;bodies[1].object.forward.i=1;
 + companion_body.progress_step=NONE;origins[1].x=3;now=30;
++ CASE("combat-approach"){
++  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};real_point3d combat_goal;long old_searches;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  CHECK(companion_combat_goal(0,1,&enemy,&combat_goal),"visible supported target supplies combat goal");
++  CHECK(fabsf(combat_goal.x-7.8f)<0.05f,"approach to conservative weapon standoff: %.2f",combat_goal.x);
++  old_searches=searches;companion_walk_direction(0,1,&enemy,&walk);
++  CHECK(walk.i>0.5f&&searches==old_searches+1,"combat goal uses validated route navigation");
++  CHECK(companion_body.order==_companion_order_follow,"combat approach preserves follow order");
++ }
++ CASE("combat-leash"){
++  struct companion_enemy enemy={2,40,TRUE,{40,0,0}};real_point3d combat_goal;int k;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  for(k=0;k<4;k++){
++   real metres[]={74,75,76,75};origins[1].x=metres[k]/COMPANION_METRES_PER_UNIT;
++   if(metres[k]<=75){CHECK(companion_combat_goal(0,1,&enemy,&combat_goal),"combat remains enabled at %.0f m",metres[k]);
++    CHECK(distance3d(&combat_goal,&origins[1])<=75.f/COMPANION_METRES_PER_UNIT+0.01f,"combat destination remains within 75 m leash");}
++   else {CHECK(!companion_combat_goal(0,1,&enemy,&combat_goal),"beyond 75 m, resume following Chief");}
++  }
++ }
++ CASE("combat-orders"){
++  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};real_point3d combat_goal;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  companion_walk_direction(0,1,&enemy,&walk);CHECK(walk.i>0.5f,"approach enemy while following");
++  companion_body.order=_companion_order_hold;companion_body.hold_point=origins[0];
++  companion_walk_direction(0,1,&enemy,&walk);CHECK(magnitude3d(&walk)==0,"stay prevents combat repositioning");
++  companion_body.order=_companion_order_move;companion_body.hold_point.x=2;now+=15;
++  CHECK(!companion_combat_goal(0,1,&enemy,&combat_goal),"go-to order suppresses combat destination override");
++  companion_walk_direction(0,1,&enemy,&walk);CHECK(walk.i>0.5f,"go-to navigation remains active");
++  companion_body.order=_companion_order_follow;companion_body.hold_fire=TRUE;now+=30;
++  companion_walk_direction(0,1,&enemy,&walk);CHECK(walk.i>0.5f,"hold fire restores ordinary follow destination");
++ }
++ CASE("combat-exit"){
++  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  companion_body.failures=companion_body.recovery=4;
++  companion_walk_direction(0,1,&enemy,&walk);CHECK(walk.i>0.5f,"enter path-based combat approach");
++  enemy.visible=FALSE;now++;
++  companion_walk_direction(0,1,&enemy,&walk);CHECK(companion_body.goal.x<3,"loss of visibility resumes ordinary following");
++ }
++ CASE("combat-approach-safety"){
++  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  search_ok=FALSE;companion_walk_direction(0,1,&enemy,&walk);
++  CHECK(magnitude3d(&walk)==0&&searches==1&&!companion_body.path_valid,"failed combat route never falls back to direct movement");
++ }
++ CASE("combat-moving-blocker"){
++  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  companion_walk_direction(0,1,&enemy,&walk);CHECK(walk.i>0.5f,"safe approach starts");
++  now++;block_clearance=TRUE;companion_walk_direction(0,1,&enemy,&walk);
++  CHECK(magnitude3d(&walk)==0,"new blocker cancels cached movement immediately");
++ }
++ CASE("combat-approach-bounds"){
++  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};int tick,moving=0;real_point3d combat_goal;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  companion_combat_goal(0,1,&enemy,&combat_goal);
++  CHECK(combat_goal.x<enemy.aim_point.x&&combat_goal.x>0,"approach stops on Kevin's side of enemy");
++  for(tick=0;tick<600;tick++,now++){
++   companion_walk_direction(0,1,&enemy,&walk);
++   if(magnitude3d(&walk)>0.01f)moving++;
++   origins[0].x+=walk.i*COMPANION_RUN_SPEED;origins[0].y+=walk.j*COMPANION_RUN_SPEED;
++   scale_vector3d(&walk,COMPANION_RUN_SPEED,&bodies[0].object.translational_velocity);
++   CHECK(origins[0].x<=combat_goal.x+0.7f,"does not overshoot firing position: %.2f > %.2f",origins[0].x,combat_goal.x);
++  }
++  CHECK(moving>0&&searches<=4,"uses bounded routed movement, moving=%d searches=%ld",moving,searches);
++ }
++ CASE("combat-leash-edge"){
++  struct companion_enemy enemy={2,40,TRUE,{40,0,0}};real_point3d combat_goal;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  origins[1].x=75.f/COMPANION_METRES_PER_UNIT;
++  CHECK(companion_combat_goal(0,1,&enemy,&combat_goal),"combat destination computed at leash boundary");
++  CHECK(distance3d(&combat_goal,&origins[1])<=75.f/COMPANION_METRES_PER_UNIT+0.01f,"enemy approach is clamped to Chief leash");
++ }
++ CASE("combat-ramp"){
++  struct companion_enemy enemy={2,15,TRUE,{0,15,0}};
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  slope=0.5f;origins[1].x=0;origins[1].y=3;
++  companion_walk_direction(0,1,&enemy,&walk);
++  CHECK(walk.j>0.1f,"normal path navigation permits safe ramp approach");
++ }
 + CASE("follow"){CHECK(companion_follow_goal(0,1,&goal),"follow must start");CHECK(companion_body.pace==1,"keep up");origins[1].x=0.5;CHECK(!companion_follow_goal(0,1,&goal),"idle near Chief");}
 + CASE("running-follow"){int moving=0;for(now=30;now<90;now++){origins[1].x+=0.075f;bodies[1].object.translational_velocity.i=0.075f;companion_walk_direction(0,1,NULL,&walk);if(walk.i>0.5f)moving++;origins[0].x+=walk.i*0.075f;}CHECK(moving>=55,"pending destinations must not stop a running follower: %d ticks",moving);CHECK(searches<=5,"bounded replans");}
 + CASE("moving-chief-stuck"){for(now=30;now<110;now++){origins[1].x+=0.03f;bodies[1].object.translational_velocity.i=0.03f;companion_walk_direction(0,1,NULL,&walk);}CHECK(companion_body.stalled_since>0,"replans cannot reset the stall timer");CHECK(companion_body.failures>0,"blocked movement enters recovery while Chief keeps moving");}
@@ -8422,10 +8563,10 @@ index c337600cfe575528cbb6141daa9098e8cdcd9152..993cc4fc59937b4bd6654d05f158cae9
  #define PI 3.14159265358979323846
 diff --git a/tools/harness/tests/test_companion.py b/tools/harness/tests/test_companion.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..1e9b6098c971d25cc8d31d4192b96732997a0d1b
+index 0000000000000000000000000000000000000000..ba36673529391c5cfdcea937f1fb9ffe948fcdb1
 --- /dev/null
 +++ b/tools/harness/tests/test_companion.py
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,105 @@
 +"""Real native companion movement against deterministic path/collision results."""
 +import sys
 +from pathlib import Path
@@ -8437,8 +8578,8 @@ index 0000000000000000000000000000000000000000..1e9b6098c971d25cc8d31d4192b96732
 +             'companion_step_clearance', 'companion_safety_invalidate', 'companion_navigation_metrics', 'companion_corridor_contains',
 +             'companion_surface_transition', 'companion_validate_corridor', 'companion_safe_direction_check', 'companion_safe_direction', 'companion_advance_waypoint', 'companion_refresh_obstacles', 'companion_movement_throttle', 'companion_try_jump', 'companion_progress_stalled',
 +             'companion_retry_ticks', 'companion_follow_goal', 'companion_goal',
-+             'companion_find_path', 'companion_walk_direction', 'companion_catch_up']
-+CASES = ['waypoint-bounds', 'waypoint-ramp', 'waypoint-invalid-surface', 'waypoint-gate-budget', 'dynamic-blocker', 'local-refit-budget', 'local-refit-atomic', 'local-refit-partial', 'local-refit-cliff', 'dynamic-blocker-clears', 'narrow-corridor', 'aiming-movement', 'throttle-old-physics', 'padding-prefix', 'waypoint-overshoot', 'waypoint-corner-blocked', 'wall-footprint-live', 'wall-footprint-gap', 'wall-parallel', 'wall-footprint-cliff', 'wall-footprint-obstruction', 'wall-footprint-jump', 'follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
++             'companion_find_path', 'companion_combat_goal', 'companion_walk_direction', 'companion_catch_up']
++CASES = ['combat-approach', 'combat-leash', 'combat-orders', 'combat-exit', 'combat-approach-safety', 'combat-moving-blocker', 'combat-approach-bounds', 'combat-leash-edge', 'combat-ramp', 'waypoint-bounds', 'waypoint-ramp', 'waypoint-invalid-surface', 'waypoint-gate-budget', 'dynamic-blocker', 'local-refit-budget', 'local-refit-atomic', 'local-refit-partial', 'local-refit-cliff', 'dynamic-blocker-clears', 'narrow-corridor', 'aiming-movement', 'throttle-old-physics', 'padding-prefix', 'waypoint-overshoot', 'waypoint-corner-blocked', 'wall-footprint-live', 'wall-footprint-gap', 'wall-parallel', 'wall-footprint-cliff', 'wall-footprint-obstruction', 'wall-footprint-jump', 'follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
 +         'cliff', 'slope', 'clearance', 'jump', 'jump-outcome', 'unsafe-jump', 'teleport', 'safety-performance', 'cache-expiry', 'cache-boundary', 'cache-turn',
 +         'cache-invalidation', 'cache-speed', 'cache-obstruction', 'cliff-speeds', 'cache-slope', 'cache-jump', 'cache-actual-position', 'floor-contact', 'doorway-transition', 'doorway-reject', 'doorway-follow', 'missing-support-cache', 'missing-nav-cache', 'missing-cache-cliff', 'terrain-recovery-wake', 'terrain-recovery-cliff']
 +
@@ -8449,6 +8590,10 @@ index 0000000000000000000000000000000000000000..1e9b6098c971d25cc8d31d4192b96732
 +    config += structure(source, 'companion_corridor') + structure(source, 'companion_nav_metrics')
 +    config += structure(source, 'companion_enemy') + structure(source, 'companion_combat_profile') + structure(source, 'companion_combat_metrics') + structure(source, 'companion_body')
 +    code = '\n'.join(function(source, name) for name in FUNCTIONS).replace('\t', ' ')
++    if fault == 'combat-leash':
++        code = mutated(code, 'real leash = 75.f / COMPANION_METRES_PER_UNIT;', 'real leash = REAL_MAX;')
++    if fault == 'combat-orders':
++        code = mutated(code, 'boolean active = companion_body.order == _companion_order_follow &&', 'boolean active = TRUE &&')
 +    if fault == 'padding':
 +        code = mutated(code, 'if ((sample - 1) * interval < reach + 0.02f)', 'if (TRUE)')
 +    if fault == 'overshoot':
@@ -8497,7 +8642,7 @@ index 0000000000000000000000000000000000000000..1e9b6098c971d25cc8d31d4192b96732
 +    assert status == 0, output
 +
 +
-+@pytest.mark.parametrize('fault,case', [('retry','retry-budget'), ('failure','failed-path'), ('pending','running-follow'), ('cache-boundary','cache-boundary'), ('cliff','cliff'), ('floor-contact','floor-contact'), ('doorway','doorway-transition'), ('support-cache','missing-support-cache'), ('wall-margin','wall-parallel'), ('wall-gap','wall-footprint-gap'), ('padding','padding-prefix'), ('overshoot','waypoint-overshoot'), ('shortcut','waypoint-corner-blocked'), ('local-refit','dynamic-blocker'), ('throttle','aiming-movement')])
++@pytest.mark.parametrize('fault,case', [('combat-leash','combat-leash'), ('combat-orders','combat-orders'), ('retry','retry-budget'), ('failure','failed-path'), ('pending','running-follow'), ('cache-boundary','cache-boundary'), ('cliff','cliff'), ('floor-contact','floor-contact'), ('doorway','doorway-transition'), ('support-cache','missing-support-cache'), ('wall-margin','wall-parallel'), ('wall-gap','wall-footprint-gap'), ('padding','padding-prefix'), ('overshoot','waypoint-overshoot'), ('shortcut','waypoint-corner-blocked'), ('local-refit','dynamic-blocker'), ('throttle','aiming-movement')])
 +def test_negative_control(fault, case):
 +    status, output = run(build('companion', generated(fault)), case)
 +    assert status == CHECK_FAILED, output
@@ -8520,7 +8665,7 @@ index 0000000000000000000000000000000000000000..1e9b6098c971d25cc8d31d4192b96732
 +    config += structure(source, 'companion_enemy') + structure(source, 'companion_body')
 +    original_functions = ['companion_navigation_radius', 'companion_flat_distance', 'companion_surface_from', 'companion_goal_surface', 'companion_ground', 'companion_clearance',
 +                          'companion_safe_direction', 'companion_try_jump', 'companion_progress_stalled', 'companion_retry_ticks',
-+                          'companion_follow_goal', 'companion_goal', 'companion_find_path', 'companion_walk_direction', 'companion_catch_up']
++                          'companion_follow_goal', 'companion_goal', 'companion_find_path', 'companion_combat_goal', 'companion_walk_direction', 'companion_catch_up']
 +    code = '\n'.join(function(source, name) for name in original_functions)
 +    for name, inputs in [('baseline', (('config.inc', config), ('under_test.inc', code))), ('current', generated())]:
 +        status, output = run(build('companion', inputs), 'safety-performance')

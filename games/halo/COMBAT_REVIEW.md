@@ -252,3 +252,40 @@ Verification: **484 native harness checks pass**, including **63 combat checks**
 The Linux release target builds, and the regenerated portable patch applies to a
 separate clean pinned checkout; all 46 patched files match byte for byte and all
 39 original paths/binary assets remain preserved.
+
+## Routed combat approach within Chief's 75-metre leash
+
+Under the persistent follow order, an acquired, currently visible target with
+fire enabled and a visible enemy now gives Kevin an enemy-relative standoff
+destination. He approaches using the same validated path, waypoint, obstruction,
+stuck recovery and safe jump pipeline used to follow Chief. The destination stops
+inside the equipped weapon's firing range, on Kevin's current side of the enemy,
+instead of orbiting around a fixed lateral-step anchor. Aim and fire remain
+independent of travel direction.
+
+Combat approach is enabled only under the follow order while fire is allowed and
+the weapon profile is supported. The requested destination is clamped to a
+**75-metre** radius around Chief. When Kevin is farther than that, or loses a
+visible target, he resumes ordinary following. Stay and go-to orders retain
+priority; hold-fire suppresses combat movement and returns to following. Route
+mode transitions invalidate the previous path and safety cache, keeping retries
+and failure budgets separate. Native Marines use actor firing-position selection
+and actor path state; Kevin cannot use those actor-bound functions, so this adapts
+their routed approach with a target-relative stop point and Kevin's existing
+validated pathfinder. It does not add autonomous flanking or pursuit beyond the
+Chief leash.
+
+Focused regressions cover a routed enemy approach, 74/75/76-metre leash edges,
+standoff before crossing the target, stay/go-to/hold-fire priority, resuming follow
+when combat ends, a failed route with no direct-walk fallback, dynamic blocker
+rejection, safe ramps and a bounded 600-tick approach. Existing corridor, cliff,
+waypoint overshoot and dynamic obstacle cases continue to exercise the navigation
+pipeline; the full suite now reports **495 passed**. This harness verifies route
+selection and safety interfaces, but cannot establish gameplay pacing or whether
+the chosen weapon-range standoff feels natural in every encounter.
+
+Kevin now moves along paths toward visible enemies within his weapon range while
+Chief remains within the 75-metre leash; when he reaches standoff range he stops
+and keeps aiming/firing. Verify that behavior against Marines in live gameplay,
+especially around doors, narrow spaces and moving enemies. Adjust the leash and
+standoff ratio after that test if needed.
