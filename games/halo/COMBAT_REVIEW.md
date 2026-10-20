@@ -289,3 +289,45 @@ Chief remains within the 75-metre leash; when he reaches standoff range he stops
 and keeps aiming/firing. Verify that behavior against Marines in live gameplay,
 especially around doors, narrow spaces and moving enemies. Adjust the leash and
 standoff ratio after that test if needed.
+
+## Stationary-combat correction
+
+Two gates explained Kevin standing still against visible enemies: target
+selection used the weapon's firing range, so targets outside that range never
+reached the approach controller; and the approach destination kept the elevated
+head/body aim-point height instead of resolving walkable ground. Failed aim
+solutions were also counted as target obstruction, so simple range or alignment
+failures could unnecessarily cool down a target.
+
+Selection now uses the Marine perception radius, capped at the 75-metre pursuit
+envelope. Fire control retains the actual native weapon minimum/maximum range and
+the existing muzzle, line-of-fire, ally and aim checks. A failed aim solve no
+longer creates an obstruction cooldown; only a shot rejected by the actual safety
+rays can do that. A lone target on cooldown remains available for movement, while
+another eligible visible threat can still replace it.
+
+Combat goals now resolve a five-point support footprint at the requested XY,
+including the height difference between Kevin and the enemy, and pass the
+verified ground surface into pathfinding. Ground results are cached for small
+target shifts and retried at a bounded rate after failure. Marine firing-position
+evaluation uses weapon combat-range bounds when configured and otherwise rewards
+positions inside 80% of maximum firing range. Kevin uses the configured range
+midpoint when present, with that native range preference as fallback; a 0.75-unit
+hysteresis prevents small target changes from repeatedly toggling movement. A
+repeated unsafe shot may select one deterministic nearby lateral firing position,
+still through the existing safe ground and path pipeline. A per-step geometric
+check prevents the route from crossing Chief's leash.
+
+Optional `debug.companion` summaries now report approach and aim-failure counts,
+fire requests rejected/not ready, requested movement, observed displacement,
+and transitions for grounding, preferred range, blocked-shot repositioning and
+the Chief boundary. Existing navigation logs still report path rejection and
+unsafe terrain. These values show controller requests and measured displacement;
+they do not prove a projectile hit or a successful engagement.
+
+The updated full native harness passes **508 tests**, including end-to-end target
+selection into routed movement, out-of-range acquisition without firing, elevated
+and ramp ground projection, near-maximum firing, preferred-range hysteresis,
+blocked-shot repositioning, route failure and the leash boundary. Gameplay is
+still needed to tune real-world positioning and confirm actual movement/fire
+behavior in Halo's collision and animation systems.

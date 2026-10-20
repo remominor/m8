@@ -1761,10 +1761,10 @@ index def58c7fbe4393450aaf5408ea57484347bdd493..f0bfa6566835845347c96ff26d251eba
  | `debug.menu_open` | `""` | `HALO_MENU_OPEN` | Start on this screen of the menus (`main_menu/settings_select/...`, as `port/assets/menus` names it), a player profile being edited, to look at it. |
 diff --git a/port/linux/game/companion.c b/port/linux/game/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2ddec5ce7
+index 0000000000000000000000000000000000000000..348982cda93a535bb3ec9dda72a9db1a5c980a0f
 --- /dev/null
 +++ b/port/linux/game/companion.c
-@@ -0,0 +1,4532 @@
+@@ -0,0 +1,4745 @@
 +/*
 +COMPANION.C
 +
@@ -2028,6 +2028,7 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	boolean origin_missing;
 +	long weapon_index;
 +	real range, minimum, vision, peripheral, central_cosine, peripheral_cosine;
++	real combat_range_lower, combat_range_upper;
 +	real central_angle, transition_angle;
 +	real lead, spread, radius, rate;
 +	long burst_ticks, pause_ticks, reaction_ticks;
@@ -2036,6 +2037,7 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +struct companion_combat_metrics
 +{
 +	long profiles, scans, visibility, decisions, aims, rays, friends, requests, blocked, report_time;
++	long approach, aim_failures, fire_not_ready, movement_requested, movement_observed;
 +};
 +
 +struct companion_shot
@@ -2072,6 +2074,18 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	real_vector3d aim;
 +	long burst_time;
 +	boolean combat_engaging;
++	boolean combat_approaching;
++	boolean combat_repositioning;
++	boolean combat_ground_valid;
++	long combat_target_index;
++	long combat_ground_retry_time;
++	real_point3d combat_ground_goal;
++	long combat_ground_surface;
++	long combat_move_log_time;
++	short combat_move_state;
++	long combat_motion_sample;
++	real_point3d combat_motion_origin;
++	boolean combat_motion_valid;
 +	boolean crouch;
 +	/* the Chief told him to stop fighting: no target, no shooting */
 +	boolean hold_fire;
@@ -2315,6 +2329,8 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	csmemset(&companion_body, 0, sizeof(companion_body));
 +	companion_body.order = _companion_order_follow;
 +	companion_body.target_unit_index = NONE;
++	companion_body.combat_target_index = NONE;
++	companion_body.combat_move_state = -1;
 +	companion_body.aim = unit_get(unit_index)->object.forward;
 +	companion_body.pace = 1.f;
 +	companion_body.player_moving_since = NONE;
@@ -2671,6 +2687,8 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +
 +		if (ranged->modified_vision_range > 0.f) profile->vision = ranged->modified_vision_range;
 +		profile->range = MAX(0.f, ranged->maximum_firing_range);
++		profile->combat_range_lower = MAX(0.f, ranged->combat_range_lower_bound);
++		profile->combat_range_upper = MAX(0.f, ranged->combat_range_upper_bound);
 +		profile->lead = PIN(ranged->target_lead_fraction, 0.f, 1.f);
 +		profile->burst_ticks = MAX(1, companion_combat_ticks(ranged->burst_geometry.burst_duration_lower_bound,
 +			ranged->burst_geometry.burst_duration_upper_bound, profile->burst_ticks, FALSE));
@@ -2944,37 +2962,71 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	return TRUE;
 +}
 +
++/* Acquisition and pursuit use the Marine perception radius; weapon range and
++minimum range are enforced separately by aiming and fire control. */
 +static boolean companion_target_eligible(struct companion_enemy const *enemy, real range)
 +{
-+	return enemy && enemy->visible && enemy->distance <= range && enemy->distance >= companion_body.combat.minimum &&
-+		!(enemy->unit_index == companion_body.target_blocked_index && game_time_get() < companion_body.target_blocked_until) &&
++	return enemy && enemy->visible && enemy->distance <= range &&
 +		companion_unit_alive(enemy->unit_index) && companion_enemy_team(unit_get(companion_unit_index)->object.owner_team_index,
 +		unit_get(enemy->unit_index)->object.owner_team_index);
++}
++
++static boolean companion_target_temporarily_blocked(struct companion_enemy const *enemy)
++{
++	return enemy && enemy->unit_index == companion_body.target_blocked_index &&
++		game_time_get() < companion_body.target_blocked_until;
++}
++
++static boolean companion_target_in_firing_range(struct companion_enemy const *enemy)
++{
++	return companion_target_eligible(enemy, companion_body.combat.range) &&
++		enemy->distance >= companion_body.combat.minimum && !companion_target_temporarily_blocked(enemy);
++}
++
++static void companion_combat_move_note(short state, char const *reason,
++	struct companion_enemy const *target)
++{
++	long now = game_time_get();
++
++	if (companion_body.combat_move_state == state || !config_boolean("debug.companion") ||
++		now < companion_body.combat_move_log_time) return;
++	companion_body.combat_move_state = state;
++	companion_body.combat_move_log_time = now + TICKS_PER_SECOND;
++	platform_log("Kevin combat movement: %s target=%08lx distance=%.1fm requested=%d nav=%d",
++		reason, target ? target->unit_index : NONE,
++		target ? target->distance * COMPANION_METRES_PER_UNIT : 0.f,
++		companion_body.requested_move, companion_body.nav_state);
++	(void)target;
 +}
 +
 +static void companion_update_target(long unit_index)
 +{
 +	struct companion_enemy *current = companion_current_target();
 +	struct companion_enemy *chosen = NULL;
-+	real range = companion_engagement_range(unit_index);
++	real range;
 +	long old = companion_body.target_unit_index;
 +	long now = game_time_get();
 +	short index;
 +	char const *reason = "no valid target";
 +
++	companion_update_combat_profile(unit_index);
++	range = MIN(companion_body.combat.vision, 75.f / COMPANION_METRES_PER_UNIT);
 +	companion_body.combat_metrics.decisions++;
 +	if (!companion_body.hold_fire)
 +	{
-+		if (companion_target_eligible(current, range))
++		if (companion_target_eligible(current, range) && !companion_target_temporarily_blocked(current))
 +			chosen = current;
 +		else
 +		{
 +			for (index = 0; index < companion_enemy_count; index++)
-+				if (companion_target_eligible(&companion_enemies[index], range))
++				if (companion_target_eligible(&companion_enemies[index], range) &&
++					!companion_target_temporarily_blocked(&companion_enemies[index]))
 +				{
 +					chosen = &companion_enemies[index];
 +					break;
 +				}
++			if (!chosen && companion_target_eligible(current, range))
++				chosen = current; /* keep approaching a lone target while fire is safely cooled down */
 +			if (current && companion_unit_alive(current->unit_index) &&
 +				companion_enemy_team(unit_get(unit_index)->object.owner_team_index, unit_get(current->unit_index)->object.owner_team_index) &&
 +				!current->visible && current->distance <= range && !chosen)
@@ -2993,7 +3045,7 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +			struct companion_enemy *candidate = &companion_enemies[index];
 +			short threat = companion_recent_threat(candidate->unit_index);
 +
-+			if (companion_target_eligible(candidate, range) && (threat > priority ||
++			if (companion_target_eligible(candidate, range) && !companion_target_temporarily_blocked(candidate) && (threat > priority ||
 +				(threat == priority && candidate->distance * 2.f < chosen->distance)))
 +			{
 +				chosen = candidate;
@@ -3002,6 +3054,10 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		}
 +	}
 +	if (chosen && chosen->visible) companion_body.target_lost_time = 0;
++	if (!chosen && companion_enemy_count && range < companion_body.combat.vision)
++		reason = "seen, outside pursuit envelope";
++	else if (!chosen && companion_enemy_count)
++		reason = "seen, no selected target";
 +	companion_body.target_unit_index = chosen ? chosen->unit_index : NONE;
 +	if (old != companion_body.target_unit_index)
 +	{
@@ -3009,8 +3065,8 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		companion_body.target_blocked_since = 0;
 +		companion_body.burst_time = now + companion_body.combat.reaction_ticks;
 +		companion_body.target_lost_time = 0;
-+		reason = chosen ? old == NONE ? "enemy acquired" : "target switched" :
-+			current && current->distance > range ? "out of range" : "enemy lost";
++			reason = chosen ? old == NONE ? "enemy acquired" : "target switched" :
++			current && current->distance > companion_body.combat.vision ? "outside perception" : "enemy lost";
 +	}
 +	else if (current && companion_body.target_visible && !current->visible)
 +		reason = "visibility failure";
@@ -3022,6 +3078,7 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	platform_log("Kevin combat: %s old=%08lx target=%08lx distance=%.1f m visible=%d",
 +		reason, old, companion_body.target_unit_index, chosen ? chosen->distance * COMPANION_METRES_PER_UNIT : 0.f,
 +		chosen && chosen->visible);
++	(void)reason;
 +	companion_body.combat_log_time = now + TICKS_PER_SECOND;
 +	companion_body.target_visible = chosen && chosen->visible;
 +}
@@ -3085,7 +3142,7 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	short magazine;
 +
 +	if (!profile->supported || companion_body.hold_fire || !enemy || !enemy->visible ||
-+		companion_body.act != _companion_act_none || !companion_target_eligible(enemy, profile->range) ||
++		companion_body.act != _companion_act_none || !companion_target_in_firing_range(enemy) ||
 +		game_time_get() - companion_body.target_time < profile->reaction_ticks ||
 +		!companion_trigger_on(game_time_get() - companion_body.burst_time, profile->latched, profile->rate)) return FALSE;
 +	weapon = weapon_get(profile->weapon_index);
@@ -3117,8 +3174,9 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +
 +	if (now < m->report_time) return;
 +	if (config_boolean("debug.companion"))
-+		platform_log("Kevin combat queries: profiles=%ld scans=%ld visibility=%ld decisions=%ld aims=%ld rays=%ld friends=%ld fire_requests=%ld blocked=%ld range=%.1fm vision=%.1fm supported=%d",
++		platform_log("Kevin combat queries: profiles=%ld scans=%ld visibility=%ld decisions=%ld aims=%ld rays=%ld friends=%ld fire_requests=%ld blocked=%ld approach=%ld aim_fail=%ld fire_not_ready=%ld move_req=%ld move_observed=%ld range=%.1fm vision=%.1fm supported=%d",
 +			m->profiles, m->scans, m->visibility, m->decisions, m->aims, m->rays, m->friends, m->requests, m->blocked,
++			m->approach, m->aim_failures, m->fire_not_ready, m->movement_requested, m->movement_observed,
 +			companion_body.combat.range * COMPANION_METRES_PER_UNIT, companion_body.combat.vision * COMPANION_METRES_PER_UNIT, companion_body.combat.supported);
 +	csmemset(m, 0, sizeof(*m));
 +	m->report_time = now + TICKS_PER_SECOND;
@@ -4213,11 +4271,16 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	boolean active = companion_body.order == _companion_order_follow &&
 +		!companion_body.hold_fire && target && target->visible && companion_body.combat.supported;
 +
-+	if (!active && !companion_body.combat_engaging) return FALSE;
++	if (!active && !companion_body.combat_engaging)
++	{
++		companion_combat_move_note(target ? 2 : 0, target ? "weapon unsupported or order overrides" : "no perceived target", target);
++		return FALSE;
++	}
 +	object_get_origin(unit_index, &origin);
 +	object_get_origin(player_unit_index, &player_origin);
 +	active = active && distance3d(&origin, &player_origin) <= leash;
-+	if (active != companion_body.combat_engaging)
++	if (active != companion_body.combat_engaging ||
++		(active && companion_body.combat_target_index != target->unit_index))
 +	{
 +		/* Never reuse a follow route for enemy approach, or let an old
 +		obstruction budget block the resumed follow order. */
@@ -4228,35 +4291,133 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		companion_body.stalled_since = 0;
 +		companion_body.progress_time = now;
 +		companion_body.next_path_time = MAX(now, companion_body.path_time + COMPANION_PATH_TICKS);
++		companion_body.combat_target_index = active ? target->unit_index : NONE;
++		companion_body.combat_approaching = FALSE;
++		companion_body.combat_repositioning = FALSE;
++		companion_body.combat_ground_valid = FALSE;
++		companion_body.combat_ground_retry_time = 0;
 +		companion_safety_invalidate();
 +	}
-+	if (!active) return FALSE;
++	if (!active)
++	{
++		companion_combat_move_note(1, "outside Chief leash; following", target);
++		return FALSE;
++	}
 +	companion_body.pace = 1.f;
 +	{
 +		real_vector3d toward;
-+		real target_distance;
++		real target_distance = companion_flat_distance(&origin, &target->aim_point);
 +		real preferred;
++		real lower = MAX(companion_body.combat.minimum + 0.5f,
++			companion_body.combat.combat_range_lower);
++		real upper = companion_body.combat.combat_range_upper;
++		real_point3d raw_goal;
++		real_point3d grounded_goal;
++		real above, below;
++		long surface = NONE;
++		boolean blocked_position = companion_body.combat_repositioning ||
++			companion_target_temporarily_blocked(target);
 +
 +		vector_from_points3d(&target->aim_point, &origin, &toward);
 +		toward.k = 0.f;
-+		target_distance = normalize3d(&toward);
-+		preferred = MAX(companion_body.combat.minimum + 0.5f,
-+			MIN(companion_body.combat.range * 0.72f, companion_body.combat.range - 0.5f));
-+		if (target_distance <= preferred || target_distance < 0.01f)
++		if (upper > lower)
++		{
++			upper = MIN(upper, companion_body.combat.range - 0.5f);
++			preferred = lower + (upper - lower) * 0.5f;
++		}
++		else
++		{
++			/* Native firing-position evaluation gives full attack-range credit
++			at 80% of maximum range. Generic profiles close two world units. */
++			preferred = MIN(companion_body.combat.range * 0.8f,
++				companion_body.combat.range - MIN(2.f,
++					(companion_body.combat.range - companion_body.combat.minimum) * 0.25f));
++		}
++		if (companion_body.combat.range - companion_body.combat.minimum > 0.5f)
++			preferred = PIN(preferred, companion_body.combat.minimum + 0.25f,
++				companion_body.combat.range - 0.25f);
++		else
++			preferred = (companion_body.combat.minimum + companion_body.combat.range) * 0.5f;
++		if (companion_target_temporarily_blocked(target))
++			companion_body.combat_repositioning = TRUE;
++		blocked_position = companion_body.combat_repositioning;
++		if (!companion_body.combat_approaching &&
++			(target_distance > preferred + 0.75f || target_distance < companion_body.combat.minimum + 0.25f || blocked_position))
++			companion_body.combat_approaching = TRUE;
++		else if (companion_body.combat_approaching && target_distance <= preferred - 0.75f)
++			companion_body.combat_approaching = FALSE;
++		if ((!companion_body.combat_approaching && !blocked_position) || target_distance < 0.01f)
++		{
++			*goal = origin;
++			companion_combat_move_note(3, "within preferred firing position", target);
++			return TRUE;
++		}
++		/* Build the horizontal standoff point on Kevin's side of the enemy. */
++		if (normalize3d(&toward) < 0.001f)
 +		{
 +			*goal = origin;
 +			return TRUE;
 +		}
-+		/* toward points from target to Kevin; stop inside weapon range on his
-+		current side, then keep the entire movement order within the Chief leash. */
-+		point_from_line3d(&target->aim_point, &toward, preferred, goal);
-+		if (distance3d(goal, &player_origin) > leash)
++		if (blocked_position)
++		{
++			real offset = MIN(1.2f, preferred * 0.25f);
++			real radial = (real)sqrt(MAX(0.f, preferred * preferred - offset * offset));
++			real side = target->unit_index & 1 ? -1.f : 1.f;
++			point_from_line3d(&target->aim_point, &toward, radial, &raw_goal);
++			raw_goal.x -= toward.j * side * offset;
++			raw_goal.y += toward.i * side * offset;
++		}
++		else
++			point_from_line3d(&target->aim_point, &toward, preferred, &raw_goal);
++		if (distance3d(&raw_goal, &player_origin) > leash)
 +		{
 +			real_vector3d from_player;
-+			vector_from_points3d(&player_origin, goal, &from_player);
++			vector_from_points3d(&player_origin, &raw_goal, &from_player);
 +			if (normalize3d(&from_player) > 0.001f)
-+				point_from_line3d(&player_origin, &from_player, leash - 0.1f, goal);
++				point_from_line3d(&player_origin, &from_player, leash - 0.1f, &raw_goal);
 +		}
++		/* Reuse a verified ground goal while a moving target shifts less than
++		one biped radius. Reground after meaningful target or surface changes. */
++		if (companion_body.combat_ground_valid &&
++			companion_flat_distance(&raw_goal, &companion_body.combat_ground_goal) < 0.5f)
++		{
++			*goal = companion_body.combat_ground_goal;
++			companion_combat_move_note(4, "approaching target outside firing range", target);
++			return TRUE;
++		}
++		if (now < companion_body.combat_ground_retry_time)
++		{
++			*goal = origin;
++			return TRUE;
++		}
++		/* Aim points can be above the floor. Cast a bounded support footprint
++		around their XY while spanning the height difference to Kevin. */
++		above = MAX(0.3f, origin.z - raw_goal.z + 0.3f);
++		below = MAX(0.3f, raw_goal.z - origin.z + 0.3f);
++		if (!companion_ground_support(unit_index, &raw_goal, above, below,
++			&grounded_goal, &surface) || !companion_walkable_surface(surface))
++		{
++			companion_body.combat_ground_valid = FALSE;
++			companion_body.combat_ground_retry_time = now + TICKS_PER_SECOND;
++			*goal = origin;
++			companion_combat_move_note(5, "combat goal has no verified walkable ground", target);
++			return TRUE;
++		}
++		if (distance3d(&grounded_goal, &player_origin) > leash)
++		{
++			companion_body.combat_ground_valid = FALSE;
++			*goal = origin;
++			companion_combat_move_note(8, "grounded combat destination exceeds Chief leash", target);
++			return TRUE;
++		}
++		companion_body.combat_ground_goal = grounded_goal;
++		companion_body.combat_ground_surface = surface;
++		companion_body.combat_ground_valid = TRUE;
++		*goal = grounded_goal;
++		companion_combat_move_note(blocked_position ? 9 : target->distance > companion_body.combat.range ? 7 : 6,
++			blocked_position ? "shot blocked; trying one nearby safe firing position" :
++			target->distance > companion_body.combat.range ? "outside firing range; approaching" :
++			"adjusting to preferred firing position", target);
 +	}
 +	return TRUE;
 +}
@@ -4273,6 +4434,7 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	real_point3d candidate;
 +	long now = game_time_get();
 +	boolean wanted;
++	boolean combat_goal;
 +
 +	companion_navigation_metrics();
 +	*direction = *global_zero_vector3d;
@@ -4311,7 +4473,8 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		companion_body.requested_move = FALSE;
 +		return;
 +	}
-+	if (companion_combat_goal(unit_index, player_unit_index, target, &goal))
++	combat_goal = companion_combat_goal(unit_index, player_unit_index, target, &goal);
++	if (combat_goal)
 +		wanted = distance3d(&origin, &goal) > 0.2f;
 +	else
 +		wanted = companion_goal(unit_index, player_unit_index, target, &goal);
@@ -4378,6 +4541,7 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	{
 +		boolean alternative = companion_body.using_alternative || companion_body.recovery == 2 || companion_body.recovery == 3;
 +		real_point3d ground;
++		long goal_surface = NONE;
 +
 +		candidate = companion_body.desired_goal;
 +		if (companion_body.using_alternative)
@@ -4397,11 +4561,21 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		}
 +		else if (companion_body.order == _companion_order_follow && companion_body.failures)
 +			object_get_origin(player_unit_index, &candidate);
-+		if (companion_ground(unit_index, &candidate, 0.3f, 0.3f, &ground))
-+			candidate = ground;
++		if (combat_goal && companion_body.combat_ground_valid && !alternative &&
++			!companion_body.using_alternative)
++		{
++			candidate = companion_body.combat_ground_goal;
++			goal_surface = companion_body.combat_ground_surface;
++		}
++		else
++		{
++			if (companion_ground(unit_index, &candidate, 0.3f, 0.3f, &ground))
++				candidate = ground;
++			goal_surface = companion_goal_surface(unit_index, &candidate);
++		}
 +		companion_body.goal = candidate;
 +		companion_body.goal_dirty = FALSE;
-+		companion_find_path(unit_index, companion_goal_surface(unit_index, &candidate));
++		companion_find_path(unit_index, goal_surface);
 +		companion_body.using_alternative = alternative && companion_body.path_valid;
 +		if (!companion_body.path_valid)
 +		{
@@ -4553,6 +4727,22 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		companion_body.requested_move = FALSE;
 +		return;
 +	}
++	if (combat_goal)
++	{
++		real_point3d player_origin;
++		real_point3d next;
++		real_vector3d displacement;
++		object_get_origin(player_unit_index, &player_origin);
++		scale_vector3d(direction, COMPANION_RUN_SPEED * companion_body.pace, &displacement);
++		point_from_line3d(&origin, &displacement, 1.f, &next);
++		if (distance3d(&next, &player_origin) > 75.f / COMPANION_METRES_PER_UNIT)
++		{
++			*direction = *global_zero_vector3d;
++			companion_body.requested_move = FALSE;
++			companion_combat_move_note(8, "movement paused at Chief leash boundary", target);
++			return;
++		}
++	}
 +	scale_vector3d(direction, companion_body.pace, direction);
 +	companion_body.requested_move = TRUE;
 +	if (config_boolean("debug.companion"))
@@ -4664,12 +4854,20 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +	unsigned long flags = 0;
 +	struct companion_shot shot;
 +	boolean solution;
++	boolean fire_request;
 +
 +	companion_update_combat_profile(unit_index);
 +	if (target) companion_refresh_enemy(unit_index, target);
 +	solution = companion_aim_solution(unit_index, target, &shot);
-+	if (!solution && target && target->visible && companion_body.combat.supported && !companion_body.combat.origin_missing)
-+		companion_blocked_target(target->unit_index);
++	if (target && target->visible)
++	{
++		if (target->distance > companion_body.combat.range)
++			companion_body.combat_metrics.approach++;
++		else if (!solution)
++			companion_body.combat_metrics.aim_failures++;
++	}
++	/* A failed native aim solution includes ordinary range/alignment failures.
++Only companion_fire_requested's actual unsafe-ray result can cool down a target. */
 +	/* (his own, as any soldier's: a magazine run dry is reloaded, if there's
 +	ammo for it) */
 +	if (companion_body.act == _companion_act_none && companion_reload_needed(held_weapon_index))
@@ -4684,6 +4882,19 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		walk = *global_zero_vector3d;
 +	else
 +		companion_walk_direction(unit_index, player_unit_index, target, &walk);
++	if (magnitude3d(&walk) > 0.01f)
++		companion_body.combat_metrics.movement_requested++;
++	{
++		real_point3d actual_position;
++		long now = game_time_get();
++		object_get_origin(unit_index, &actual_position);
++		if (companion_body.combat_motion_valid && now > companion_body.combat_motion_sample &&
++			distance3d(&actual_position, &companion_body.combat_motion_origin) > COMPANION_MOVING_SPEED)
++			companion_body.combat_metrics.movement_observed++;
++		companion_body.combat_motion_origin = actual_position;
++		companion_body.combat_motion_sample = now;
++		companion_body.combat_motion_valid = TRUE;
++	}
 +	/* Legacy pickups/vehicles remain implemented, outside the active order path. */
 +
 +	act_ticks = game_time_get() - companion_body.act_time;
@@ -4785,8 +4996,10 @@ index 0000000000000000000000000000000000000000..bcd6d1d3e0fb7c47c491081620d1feb2
 +		companion_body.act = _companion_act_none;
 +
 +	/* No model request: the native solution and both fresh firing rays decide. */
-+	SET_FLAG(flags, _unit_control_weapon_primary_trigger_bit,
-+		solution && companion_fire_requested(unit_index, target, &shot));
++	fire_request = solution && companion_fire_requested(unit_index, target, &shot);
++	if (solution && !fire_request)
++		companion_body.combat_metrics.fire_not_ready++;
++	SET_FLAG(flags, _unit_control_weapon_primary_trigger_bit, fire_request);
 +	companion_combat_report();
 +
 +	/* crouching as mate said, and in cover once there */
@@ -7427,10 +7640,10 @@ index be0bf6fc138d9c7bfbea6c9a7e2144901bbe46e9..754a6c1adeb8a01ed927778cb2c80eaa
      lines.append(art.port_picture("blank", [
 diff --git a/tools/harness/tests/companion.c b/tools/harness/tests/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa40af65c6
+index 0000000000000000000000000000000000000000..99b35c4cdd1e6015d1924d526c7b0b6d87e2ac12
 --- /dev/null
 +++ b/tools/harness/tests/companion.c
-@@ -0,0 +1,564 @@
+@@ -0,0 +1,634 @@
 +#include "harness.h"
 +#include <math.h>
 +#define TICKS_PER_SECOND 30
@@ -7452,6 +7665,7 @@ index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa
 +#define _collision_result_structure 2
 +#define _collision_test_for_bipeds_living_flags 7
 +#define _biped_airborne_bit 0
++#define _object_dead_bit 0
 +#define _biped_uses_old_player_physics_bit 1
 +#define cinematic_in_progress() 0
 +#define _companion_act_jump 5
@@ -7465,7 +7679,7 @@ index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa
 +struct path_state {struct path_input input;void *debug;};
 +struct path_debug_storage {short path_traverse_result,path_build_result;};
 +static struct path_debug_storage companion_path_debug;
-+struct biped_datum { long definition_index; struct {long parent_object_index; real_vector3d translational_velocity,forward;} object;
++struct biped_datum { long definition_index; struct {long parent_object_index; short owner_team_index; unsigned damage_flags; real_vector3d translational_velocity,forward;} object;
 + struct {unsigned flags; long support_surface_index; short jump_recovery_timer, landing;} biped; };
 +struct biped_definition { struct { real collision_radius,runtime_minimum_normal_k,jump_velocity,collision_height_standing; unsigned flags; } biped; };
 +struct game_globals_player_information { real run_acceleration,run_forward_speed,run_backward_speed,run_sideways_speed; };
@@ -7482,8 +7696,10 @@ index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa
 +struct collision_result { short type; long surface_index; struct {real_vector3d n;} plane; real_point3d point; };
 +#include "config.inc"
 +static struct companion_body companion_body;
++static struct companion_enemy companion_enemies[12];
++static short companion_enemy_count;
 +static struct path_state companion_path_state;
-+static struct biped_datum bodies[2];
++static struct biped_datum bodies[5];
 +static struct biped_definition fake_definition;
 +static struct game_globals_player_information fake_information;
 +static real_point3d origins[2];
@@ -7543,7 +7759,10 @@ index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa
 + return TRUE;
 +}
 +static long companion_player_unit(void){return 1;}
-+static boolean companion_unit_alive(long i){return i==0||i==1;}
++static boolean companion_unit_alive(long i){return i>=0&&i<5&&!TEST_FLAG(bodies[i].object.damage_flags,_object_dead_bit);}
++static boolean companion_enemy_team(short player,short enemy){return player!=enemy;}
++static short companion_recent_threat(long i){return 0;}
++static void companion_update_combat_profile(long i){}
 +static void path_input_new(struct path_input *p,real r,boolean b,long i){memset(p,0,sizeof(*p));p->pathfinding_radius=r;p->ignore_source_object_index=i;}
 +static void path_input_set_start(struct path_input *p,const real_point3d *s,long i){p->start_point=*s;p->start_surface_index=i;}
 +static void path_state_new(struct path_input *p,struct path_state *s,void *d){}
@@ -7582,12 +7801,76 @@ index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa
 + fake_information.run_acceleration=0.32f;fake_information.run_forward_speed=2.25f;fake_information.run_backward_speed=2.f;fake_information.run_sideways_speed=2.f;fake_definition.biped.collision_height_standing=0.7f;
 + bodies[0].biped.support_surface_index=1;bodies[0].object.parent_object_index=NONE;bodies[0].biped.jump_recovery_timer=10;
 + bodies[1].biped.support_surface_index=1;bodies[1].object.forward.i=1;
++ bodies[0].object.owner_team_index=bodies[1].object.owner_team_index=1;bodies[2].object.owner_team_index=2;
 + companion_body.progress_step=NONE;origins[1].x=3;now=30;
++ CASE("pipeline-pursuit"){
++  struct companion_enemy enemy={2,20,TRUE,{20,0,1.5f}};
++  companion_enemy_count=1;companion_enemies[0]=enemy;companion_body.target_unit_index=NONE;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=13;companion_body.combat.minimum=0;
++  companion_body.combat.vision=25;
++  companion_update_target(0);
++  CHECK(companion_body.target_unit_index==2,"visible target beyond rifle range remains selected for pursuit");
++  CHECK(companion_body.target_unit_index!=NONE&&companion_current_target()==&companion_enemies[0],"movement receives selected target");
++  companion_walk_direction(0,1,companion_current_target(),&walk);
++  CHECK(walk.i>0.5f&&searches==1,"selected out-of-range target drives safe path approach");
++  CHECK(companion_body.combat_ground_valid&&companion_body.combat_ground_goal.z==0,"head/body aim height is projected to verified floor");
++  CHECK(destination.z==0&&companion_body.path_valid,"path destination uses grounded point");
++ }
++ CASE("pipeline-failed-route"){
++  struct companion_enemy enemy={2,20,TRUE,{20,0,1.5f}};
++  companion_enemy_count=1;companion_enemies[0]=enemy;companion_body.target_unit_index=NONE;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=13;companion_body.combat.vision=25;search_ok=FALSE;
++  companion_update_target(0);CHECK(companion_body.target_unit_index==2,"target acquired before blocked route");
++  companion_walk_direction(0,1,companion_current_target(),&walk);
++  CHECK(magnitude3d(&walk)==0&&searches==1&&!companion_body.path_valid,"unreachable combat destination never uses direct movement");
++ }
++ CASE("chief-leash-boundary"){
++  struct companion_enemy enemy={2,40,TRUE,{40,0,0}};int tick;
++  origins[0].x=24.f;origins[1].x=0.f;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  for(tick=0;tick<40;tick++,now++){
++   companion_walk_direction(0,1,&enemy,&walk);
++   origins[0].x+=walk.i*COMPANION_RUN_SPEED;origins[0].y+=walk.j*COMPANION_RUN_SPEED;
++   CHECK(distance3d(&origins[0],&origins[1])<=75.f/COMPANION_METRES_PER_UNIT+0.001f,"never cross Chief's 75 m movement boundary");
++  }
++ }
++ CASE("combat-near-max"){
++  struct companion_enemy enemy={2,12,TRUE,{12,0,0}};real_point3d combat_goal;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=13;companion_body.combat.minimum=0;
++  CHECK(companion_combat_goal(0,1,&enemy,&combat_goal),"target inside maximum range remains combat eligible");
++  CHECK(companion_body.combat_approaching&&fabsf(combat_goal.x-1.6f)<0.05f,"approach from near maximum toward native preferred range");
++ }
++ CASE("combat-reposition-blocked"){
++  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};real_point3d combat_goal;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
++  companion_body.target_blocked_index=2;companion_body.target_blocked_until=now+30;
++  CHECK(companion_combat_goal(0,1,&enemy,&combat_goal),"blocked target retains movement goal");
++  CHECK(companion_body.combat_repositioning&&fabsf(fabsf(combat_goal.y)-1.2f)<0.05f,"try one deterministic nearby firing position");
++  companion_walk_direction(0,1,&enemy,&walk);
++  CHECK(magnitude3d(&walk)>0.5f&&searches==1,"reposition uses normal safe path navigation");
++ }
++ CASE("combat-preferred-hysteresis"){
++  struct companion_enemy enemy={2,6,TRUE,{6,0,0}};real_point3d combat_goal;long probes,old_searches;
++  companion_body.combat.supported=TRUE;companion_body.combat.range=13;companion_body.combat.minimum=1;
++  companion_body.combat.combat_range_lower=4;companion_body.combat.combat_range_upper=8;
++  CHECK(companion_combat_goal(0,1,&enemy,&combat_goal)&&!companion_body.combat_approaching,"hold at native combat-range midpoint");
++  CHECK(combat_goal.x==origins[0].x,"no gratuitous movement inside preferred distance");
++  enemy.aim_point.x=8.6f;
++  CHECK(companion_combat_goal(0,1,&enemy,&combat_goal)&&companion_body.combat_approaching,"move beyond preferred distance with hysteresis");
++  CHECK(fabsf(combat_goal.x-2.6f)<0.05f,"native lower/upper bounds determine approach distance");
++  old_searches=searches;companion_walk_direction(0,1,&enemy,&walk);
++  CHECK(searches==old_searches+1,"initial preferred-position route is planned once");
++  probes=ground_probes;old_searches=searches;enemy.aim_point.x=8.8f;
++  companion_combat_goal(0,1,&enemy,&combat_goal);
++  CHECK(ground_probes==probes,"small moving-target changes reuse verified ground goal");
++  companion_walk_direction(0,1,&enemy,&walk);
++  CHECK(searches==old_searches,"small target movement does not invalidate the active route");
++ }
 + CASE("combat-approach"){
 +  struct companion_enemy enemy={2,15,TRUE,{15,0,0}};real_point3d combat_goal;long old_searches;
 +  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
 +  CHECK(companion_combat_goal(0,1,&enemy,&combat_goal),"visible supported target supplies combat goal");
-+  CHECK(fabsf(combat_goal.x-7.8f)<0.05f,"approach to conservative weapon standoff: %.2f",combat_goal.x);
++  CHECK(fabsf(combat_goal.x-7.f)<0.05f,"approach to conservative weapon standoff: %.2f",combat_goal.x);
 +  old_searches=searches;companion_walk_direction(0,1,&enemy,&walk);
 +  CHECK(walk.i>0.5f&&searches==old_searches+1,"combat goal uses validated route navigation");
 +  CHECK(companion_body.order==_companion_order_follow,"combat approach preserves follow order");
@@ -7657,11 +7940,11 @@ index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa
 +  CHECK(distance3d(&combat_goal,&origins[1])<=75.f/COMPANION_METRES_PER_UNIT+0.01f,"enemy approach is clamped to Chief leash");
 + }
 + CASE("combat-ramp"){
-+  struct companion_enemy enemy={2,15,TRUE,{0,15,0}};
++  struct companion_enemy enemy={2,15,TRUE,{15,0,2.2f}};
 +  companion_body.combat.supported=TRUE;companion_body.combat.range=10;companion_body.combat.minimum=1;
-+  slope=0.5f;origins[1].x=0;origins[1].y=3;
++  slope=0.1f;origins[1].x=0;origins[1].y=3;
 +  companion_walk_direction(0,1,&enemy,&walk);
-+  CHECK(walk.j>0.1f,"normal path navigation permits safe ramp approach");
++  CHECK(walk.i>0.1f&&fabsf(companion_body.combat_ground_goal.z-0.7f)<0.05f,"elevated enemy uses reachable ramp surface");
 + }
 + CASE("follow"){CHECK(companion_follow_goal(0,1,&goal),"follow must start");CHECK(companion_body.pace==1,"keep up");origins[1].x=0.5;CHECK(!companion_follow_goal(0,1,&goal),"idle near Chief");}
 + CASE("running-follow"){int moving=0;for(now=30;now<90;now++){origins[1].x+=0.075f;bodies[1].object.translational_velocity.i=0.075f;companion_walk_direction(0,1,NULL,&walk);if(walk.i>0.5f)moving++;origins[0].x+=walk.i*0.075f;}CHECK(moving>=55,"pending destinations must not stop a running follower: %d ticks",moving);CHECK(searches<=5,"bounded replans");}
@@ -7997,10 +8280,10 @@ index 0000000000000000000000000000000000000000..dd4ec0a2ecddb1ec9490c99386f854aa
 +}
 diff --git a/tools/harness/tests/companion_combat.c b/tools/harness/tests/companion_combat.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..7bb113203f6477bf725b5772bcc2de66d5e71f69
+index 0000000000000000000000000000000000000000..8def6513d4fa9ab1930feb362afe9fc7d07f1a15
 --- /dev/null
 +++ b/tools/harness/tests/companion_combat.c
-@@ -0,0 +1,428 @@
+@@ -0,0 +1,450 @@
 +#include "harness.h"
 +#include <math.h>
 +#undef CASE
@@ -8060,7 +8343,7 @@ index 0000000000000000000000000000000000000000..7bb113203f6477bf725b5772bcc2de66
 +struct weapon_datum {long definition_index;struct {unsigned flags;long parent_object_index;} object;struct {short state;unsigned flags;struct {short state,rounds_loaded,rounds_total;} magazines[2];} weapon;};
 +struct projectile_definition {struct {unsigned flags;real initial_velocity,air_gravity_scale,danger_radius,air_damage_range_upper_bound,maximum_range,collision_radius;struct tag_reference super_detonation,attached_detonation_damage,impact_damage;} projectile;};
 +struct actor_burst_geometry {real burst_duration_lower_bound,burst_duration_upper_bound,burst_separation_lower_bound,burst_separation_upper_bound;};
-+struct actor_ranged_combat_properties {struct tag_reference reference;real modified_vision_range,maximum_firing_range,target_lead_fraction,first_burst_delay_lower_bound,first_burst_delay_upper_bound;struct actor_burst_geometry burst_geometry;};
++struct actor_ranged_combat_properties {struct tag_reference reference;real modified_vision_range,maximum_firing_range,target_lead_fraction,first_burst_delay_lower_bound,first_burst_delay_upper_bound,combat_range_lower_bound,combat_range_upper_bound;struct actor_burst_geometry burst_geometry;};
 +struct actor_variant_definition {struct tag_reference actor_reference;struct actor_ranged_combat_properties ranged_combat;};
 +struct actor_definition {short type;struct {real maximum_vision_distance,peripheral_distance,central_vision_angle,maximum_vision_angle,peripheral_vision_angle;} perception;};
 +struct unit_definition {struct {unsigned flags;} unit;};
@@ -8234,8 +8517,29 @@ index 0000000000000000000000000000000000000000..7bb113203f6477bf725b5772bcc2de66
 + }
 + CASE("minimum-range"){
 +  test_weapon_definition.weapon.ai_minimum_target_range=6;held_weapon=1;companion_update_combat_profile(0);
-+  CHECK(!companion_target_eligible(&companion_enemies[0],companion_engagement_range(0)),"too-close targets cannot fire");
-+  CHECK(companion_target_eligible(&companion_enemies[1],companion_engagement_range(0)),"valid native range remains available");
++  CHECK(companion_target_eligible(&companion_enemies[0],companion_body.combat.vision),"perception retains too-close target");
++  CHECK(!companion_target_in_firing_range(&companion_enemies[0]),"too-close targets cannot fire");
++  CHECK(companion_target_in_firing_range(&companion_enemies[1]),"valid native firing range remains available");
++ }
++ CASE("out-of-range-no-obstruction"){
++  companion_enemies[0].distance=20;companion_enemies[0].aim_point.x=20;
++  companion_body.target_blocked_since=0;companion_body.target_blocked_index=NONE;
++  CHECK(!companion_aim_solution(0,&companion_enemies[0],&shot),"native aim rejects target outside firing range");
++  CHECK(companion_body.target_blocked_since==0&&companion_body.target_blocked_index==NONE,"range rejection is never treated as obstruction");
++ }
++ CASE("blocked-target-held-for-reposition"){
++  companion_enemy_count=1;companion_body.target_unit_index=2;companion_body.target_blocked_index=2;
++  companion_body.target_blocked_until=now+30;companion_update_target(0);
++  CHECK(companion_body.target_unit_index==2,"a lone temporarily blocked target remains selected for safe repositioning");
++  ready_shot(&shot);CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"cooldown still prevents firing while movement can reposition");
++ }
++ CASE("near-maximum-fire"){
++  companion_enemies[0].distance=12;companion_enemies[0].aim_point.x=12;
++  companion_body.target_time=now-12;companion_body.burst_time=now;
++  CHECK(companion_target_in_firing_range(&companion_enemies[0]),"target just inside weapon maximum remains fire eligible");
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot),"native aim solution works near maximum range");
++  companion_body.aim=actual_aim=shot.aim;
++  CHECK(companion_fire_requested(0,&companion_enemies[0],&shot),"safe shot can fire while movement approaches preferred range");
 + }
 + CASE("unsupported"){
 +  int kind;
@@ -8413,6 +8717,7 @@ index 0000000000000000000000000000000000000000..7bb113203f6477bf725b5772bcc2de66
 + CASE("profiles"){CHECK(companion_engagement_range(0)==13,"native Marine rifle range");CHECK(companion_body.combat.vision==40,"native Marine vision");CHECK(tag_scans==1,"profile cached");}
 +
 + CASE("acquire"){companion_update_target(0);CHECK(companion_body.target_unit_index==2,"automatic nearest");CHECK(companion_body.target_time==now,"reaction clock");CHECK(companion_body.order==_companion_order_follow,"combat preserves follow");}
++ CASE("pursuit-outside-range"){companion_enemies[0].distance=20;companion_body.combat.vision=25;companion_body.target_unit_index=NONE;companion_update_target(0);CHECK(companion_body.target_unit_index==2,"visible target inside perception and pursuit remains selected outside rifle range");CHECK(!companion_target_in_firing_range(&companion_enemies[0]),"selected pursuit target is not fire eligible outside max range");}
 + CASE("occluded-elite"){companion_enemies[0].visible=FALSE;companion_body.target_unit_index=2;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"visible beats nearer occluded target");companion_enemies[0].distance=33.5f;companion_body.target_unit_index=2;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"visible nearby beats invisible 102m elite");}
 + CASE("retain"){companion_body.target_unit_index=3;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"stable valid target");}
 + CASE("switch"){companion_body.target_unit_index=2;units[2].object.damage_flags=1;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"dead target cleared");units[3].object.damage_flags=1;companion_update_target(0);CHECK(companion_body.target_unit_index==NONE,"no valid target");}
@@ -8563,7 +8868,7 @@ index c337600cfe575528cbb6141daa9098e8cdcd9152..993cc4fc59937b4bd6654d05f158cae9
  #define PI 3.14159265358979323846
 diff --git a/tools/harness/tests/test_companion.py b/tools/harness/tests/test_companion.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..ba36673529391c5cfdcea937f1fb9ffe948fcdb1
+index 0000000000000000000000000000000000000000..779edccb6b0a16de387e16252925d3fee2de9f3d
 --- /dev/null
 +++ b/tools/harness/tests/test_companion.py
 @@ -0,0 +1,105 @@
@@ -8578,8 +8883,8 @@ index 0000000000000000000000000000000000000000..ba36673529391c5cfdcea937f1fb9ffe
 +             'companion_step_clearance', 'companion_safety_invalidate', 'companion_navigation_metrics', 'companion_corridor_contains',
 +             'companion_surface_transition', 'companion_validate_corridor', 'companion_safe_direction_check', 'companion_safe_direction', 'companion_advance_waypoint', 'companion_refresh_obstacles', 'companion_movement_throttle', 'companion_try_jump', 'companion_progress_stalled',
 +             'companion_retry_ticks', 'companion_follow_goal', 'companion_goal',
-+             'companion_find_path', 'companion_combat_goal', 'companion_walk_direction', 'companion_catch_up']
-+CASES = ['combat-approach', 'combat-leash', 'combat-orders', 'combat-exit', 'combat-approach-safety', 'combat-moving-blocker', 'combat-approach-bounds', 'combat-leash-edge', 'combat-ramp', 'waypoint-bounds', 'waypoint-ramp', 'waypoint-invalid-surface', 'waypoint-gate-budget', 'dynamic-blocker', 'local-refit-budget', 'local-refit-atomic', 'local-refit-partial', 'local-refit-cliff', 'dynamic-blocker-clears', 'narrow-corridor', 'aiming-movement', 'throttle-old-physics', 'padding-prefix', 'waypoint-overshoot', 'waypoint-corner-blocked', 'wall-footprint-live', 'wall-footprint-gap', 'wall-parallel', 'wall-footprint-cliff', 'wall-footprint-obstruction', 'wall-footprint-jump', 'follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
++             'companion_find_path', 'companion_enemy_get', 'companion_current_target', 'companion_target_eligible', 'companion_target_temporarily_blocked', 'companion_update_target', 'companion_combat_move_note', 'companion_combat_goal', 'companion_walk_direction', 'companion_catch_up']
++CASES = ['pipeline-pursuit', 'pipeline-failed-route', 'chief-leash-boundary', 'combat-near-max', 'combat-preferred-hysteresis', 'combat-reposition-blocked', 'combat-approach', 'combat-leash', 'combat-orders', 'combat-exit', 'combat-approach-safety', 'combat-moving-blocker', 'combat-approach-bounds', 'combat-leash-edge', 'combat-ramp', 'waypoint-bounds', 'waypoint-ramp', 'waypoint-invalid-surface', 'waypoint-gate-budget', 'dynamic-blocker', 'local-refit-budget', 'local-refit-atomic', 'local-refit-partial', 'local-refit-cliff', 'dynamic-blocker-clears', 'narrow-corridor', 'aiming-movement', 'throttle-old-physics', 'padding-prefix', 'waypoint-overshoot', 'waypoint-corner-blocked', 'wall-footprint-live', 'wall-footprint-gap', 'wall-parallel', 'wall-footprint-cliff', 'wall-footprint-obstruction', 'wall-footprint-jump', 'follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
 +         'cliff', 'slope', 'clearance', 'jump', 'jump-outcome', 'unsafe-jump', 'teleport', 'safety-performance', 'cache-expiry', 'cache-boundary', 'cache-turn',
 +         'cache-invalidation', 'cache-speed', 'cache-obstruction', 'cliff-speeds', 'cache-slope', 'cache-jump', 'cache-actual-position', 'floor-contact', 'doorway-transition', 'doorway-reject', 'doorway-follow', 'missing-support-cache', 'missing-nav-cache', 'missing-cache-cliff', 'terrain-recovery-wake', 'terrain-recovery-cliff']
 +
@@ -8665,7 +8970,7 @@ index 0000000000000000000000000000000000000000..ba36673529391c5cfdcea937f1fb9ffe
 +    config += structure(source, 'companion_enemy') + structure(source, 'companion_body')
 +    original_functions = ['companion_navigation_radius', 'companion_flat_distance', 'companion_surface_from', 'companion_goal_surface', 'companion_ground', 'companion_clearance',
 +                          'companion_safe_direction', 'companion_try_jump', 'companion_progress_stalled', 'companion_retry_ticks',
-+                          'companion_follow_goal', 'companion_goal', 'companion_find_path', 'companion_combat_goal', 'companion_walk_direction', 'companion_catch_up']
++                          'companion_follow_goal', 'companion_goal', 'companion_find_path', 'companion_enemy_get', 'companion_current_target', 'companion_target_eligible', 'companion_target_temporarily_blocked', 'companion_update_target', 'companion_combat_move_note', 'companion_combat_goal', 'companion_walk_direction', 'companion_catch_up']
 +    code = '\n'.join(function(source, name) for name in original_functions)
 +    for name, inputs in [('baseline', (('config.inc', config), ('under_test.inc', code))), ('current', generated())]:
 +        status, output = run(build('companion', inputs), 'safety-performance')
@@ -8674,10 +8979,10 @@ index 0000000000000000000000000000000000000000..ba36673529391c5cfdcea937f1fb9ffe
 +        print(f'{name}: {output}')
 diff --git a/tools/harness/tests/test_companion_combat.py b/tools/harness/tests/test_companion_combat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d0904a531a018973155d67a862896c9ee403d3ee
+index 0000000000000000000000000000000000000000..f43843610019556b81ca38f1058dfbeec7c5af3f
 --- /dev/null
 +++ b/tools/harness/tests/test_companion_combat.py
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,86 @@
 +"""Native targeting, fire safety, command parsing and persistent orders."""
 +import sys
 +import re
@@ -8688,10 +8993,10 @@ index 0000000000000000000000000000000000000000..d0904a531a018973155d67a862896c9e
 +FUNCTIONS = ['companion_enemy_team','companion_unit_alive','companion_enemy_get','companion_current_target',
 +             'companion_combat_ticks','companion_update_combat_profile','companion_engagement_range',
 +             'companion_recent_threat','companion_refresh_enemy','companion_enemy_in_view','companion_firing_origin','companion_aim_solution','companion_friendly_cone',
-+             'companion_safe_shot','companion_target_eligible','companion_update_target','companion_in_combat','companion_trigger_on','companion_blocked_target','companion_fire_requested','companion_reload_needed','companion_look_around',
++             'companion_safe_shot','companion_target_eligible','companion_target_temporarily_blocked','companion_target_in_firing_range','companion_update_target','companion_in_combat','companion_trigger_on','companion_blocked_target','companion_fire_requested','companion_reload_needed','companion_look_around',
 +             'companion_set_order','companion_message_value','companion_message_number',
 +             'companion_context_current','companion_capture_context','companion_apply_command','companion_reset_body']
-+CASES = ['a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'combat-measure-blocked', 'marine-transition-vision', 'blocked-retarget', 'native-profile-override', 'minimum-range', 'unsupported', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'aim-failure', 'head-visibility', 'marine-vision', 'recent-attacker', 'dead-occluded', 'muzzle-safety', 'actual-ray-safety', 'friendly-entry', 'friendly-intended-and-actual', 'reload-and-heat', 'weapon-change', 'semi-bursts', 'fire-and-orders', 'sensing-budget', 'combat-measure', 'combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
++CASES = ['a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'combat-measure-blocked', 'marine-transition-vision', 'blocked-retarget', 'native-profile-override', 'minimum-range', 'blocked-target-held-for-reposition', 'out-of-range-no-obstruction', 'near-maximum-fire', 'pursuit-outside-range', 'unsupported', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'aim-failure', 'head-visibility', 'marine-vision', 'recent-attacker', 'dead-occluded', 'muzzle-safety', 'actual-ray-safety', 'friendly-entry', 'friendly-intended-and-actual', 'reload-and-heat', 'weapon-change', 'semi-bursts', 'fire-and-orders', 'sensing-budget', 'combat-measure', 'combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
 +         'trigger','captured-aim','orders','reject-location','context','parser','reset']
 +
 +
@@ -8748,7 +9053,7 @@ index 0000000000000000000000000000000000000000..d0904a531a018973155d67a862896c9e
 +    assert status==CHECK_FAILED,output
 +
 +
-+@pytest.mark.parametrize('case', ['a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'native-profile-override', 'minimum-range', 'unsupported', 'origin-camera', 'combat-measure-blocked'])
++@pytest.mark.parametrize('case', ['a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'native-profile-override', 'minimum-range', 'out-of-range-no-obstruction', 'near-maximum-fire', 'pursuit-outside-range', 'unsupported', 'origin-camera', 'combat-measure-blocked'])
 +def test_native_weapon_adapter(case):
 +    status, output = run(build('companion_combat', generated(native=True)), case)
 +    assert status == 0, output
@@ -8756,10 +9061,12 @@ index 0000000000000000000000000000000000000000..d0904a531a018973155d67a862896c9e
 +
 +def test_combat_control_wiring():
 +    control = function(read('port/linux/game/companion.c'), 'companion_control')
-+    assert '!companion_body.combat.origin_missing' in control
++    assert 'companion_walk_direction(unit_index, player_unit_index, target, &walk)' in control
 +    assert 'companion_refresh_enemy(unit_index, target)' in control
 +    assert 'companion_aim_solution(unit_index, target, &shot)' in control
++    assert 'if (!solution && target' not in control
 +    assert 'solution && companion_fire_requested(unit_index, target, &shot)' in control
++    assert 'if (solution)' in control and 'solution && companion_fire_requested' in control
 +    assert 'companion_reload_needed(held_weapon_index)' in control
 +    assert 'companion_movement_throttle(unit_index, &walk, &facing, &control.throttle)' in control
 diff --git a/tools/harness/tests/test_companion_obstacles.py b/tools/harness/tests/test_companion_obstacles.py
