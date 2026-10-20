@@ -685,7 +685,19 @@ impl Brain {
         let speak = to_player
             || ask_speak
                 && {
-                    let question = json!({"speak": {"type": "noul", "instructions": format!("Should {} speak now?", self.cfg.mate.name)}});
+                    let instructions = format!(
+                        concat!(
+                            "Decide whether {name} should make a brief, unsolicited spoken reaction to the latest game event. ",
+                            "{name} is a cocky Spartan companion, not a passive narrator. ",
+                            "Favor speaking when an event deserves a warning, tactical callout, celebration, insult, or personal reaction—",
+                            "such as enemies appearing, someone taking heavy damage, a notable kill, or a new objective. ",
+                            "Remain silent for routine, repetitive, or unremarkable events, or when {name} has recently made a similar comment. ",
+                            "If {name} has been quiet for a while, be more willing to make a relevant remark. ",
+                            "Do not speak merely to announce what is already obvious."
+                        ),
+                        name = self.cfg.mate.name,
+                    );
+                    let question = json!({"speak": {"type": "noul", "instructions": instructions}});
                     match self.kev("speak", &self.prompt(), &question, &mut calls) {
                         Ok(answer) => answer["speak"]["noul"].as_f64().unwrap_or(0.0) >= 0.5,
                         Err(error) => {

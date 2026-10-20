@@ -1761,10 +1761,10 @@ index def58c7fbe4393450aaf5408ea57484347bdd493..f0bfa6566835845347c96ff26d251eba
  | `debug.menu_open` | `""` | `HALO_MENU_OPEN` | Start on this screen of the menus (`main_menu/settings_select/...`, as `port/assets/menus` names it), a player profile being edited, to look at it. |
 diff --git a/port/linux/game/companion.c b/port/linux/game/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c493060b9
+index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715366ab26f
 --- /dev/null
 +++ b/port/linux/game/companion.c
-@@ -0,0 +1,3791 @@
+@@ -0,0 +1,4449 @@
 +/*
 +COMPANION.C
 +
@@ -1794,6 +1794,10 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +
 +#include "cseries.h"
 +#include "cseries/cseries_windows.h"
++#include "ai/actor_definitions.h"
++#include "ai/actor_types.h"
++#include "cache/cache_files.h"
++#include "items/projectile_definitions.h"
 +#include "ai/path.h"
 +#include "ai/path_structure_bsp.h"
 +#include "bitmaps/bitmap_group.h"
@@ -1804,6 +1808,7 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +#include "game/game_allegiance.h"
 +#include "game/game_engine.h"
 +#include "game/game_globals.h"
++#include "objects/damage_effect_definitions.h"
 +#include "game/players.h"
 +#include "interface/hud_messaging.h"
 +#include "interface/terminal.h"
@@ -1825,6 +1830,7 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +#include "sound/sound_definitions.h"
 +#include "sound/sound_manager.h"
 +#include "structures/structures.h"
++#include "structures/structure_bsp_definitions.h"
 +#include "tag_files/tag_files.h"
 +#include "units/bipeds.h"
 +#include "units/biped_definitions.h"
@@ -2004,19 +2010,54 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +{
 +	long corridors;
 +	long ground;
++	long walls;
 +	long clearance;
 +	long bsp;
 +	long paths;
++	long local_refits;
++	long shortcuts;
++	long shortened;
 +	long reuse;
 +	long rejected;
 +	long report_time;
 +};
 +
++struct companion_combat_profile
++{
++	boolean initialized;
++	boolean supported;
++	boolean latched;
++	long weapon_index;
++	real range, minimum, vision, peripheral, central_cosine, peripheral_cosine;
++	real central_angle, transition_angle;
++	real lead, spread, radius, rate;
++	long burst_ticks, pause_ticks, reaction_ticks;
++};
++
++struct companion_combat_metrics
++{
++	long profiles, scans, visibility, decisions, aims, rays, friends, requests, blocked, report_time;
++};
++
++struct companion_shot
++{
++	real_point3d origin, target;
++	real_vector3d aim;
++	real distance;
++};
++
 +struct companion_body
 +{
++	struct companion_combat_profile combat;
++	struct companion_combat_metrics combat_metrics;
++	long enemy_scan_time;
++	long target_blocked_since, target_blocked_index, target_blocked_until;
 +	struct companion_corridor safety[2];
 +	struct companion_nav_metrics metrics;
 +	boolean safety_obstructed;
++	char const *safety_reason;
++	char const *safety_stage;
++	real_point3d safety_point;
 +	short order;
 +	long target_unit_index;
 +	/* hold: where he stands */
@@ -2068,6 +2109,8 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	short failures;
 +	short recovery;
 +	long next_path_time;
++	long local_path_time;
++	long waypoint_test_time;
 +	long progress_time;
 +	long stalled_since;
 +	real_point3d progress_waypoint;
@@ -2147,6 +2190,7 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +static struct companion_command_context companion_contexts[32];
 +static boolean companion_ground(long unit_index, real_point3d const *point, real above, real below, real_point3d *ground);
 +static void companion_navigation_note(char const *reason);
++static long companion_navigation_start(long unit_index, real_point3d *ground);
 +
 +/* ---------- private code */
 +
@@ -2419,6 +2463,10 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	return unit && !TEST_FLAG(unit->object.damage_flags, _object_dead_bit);
 +}
 +
++static void companion_update_combat_profile(long unit_index);
++static boolean companion_refresh_enemy(long unit_index, struct companion_enemy *enemy);
++static boolean companion_enemy_in_view(long unit_index, struct companion_enemy const *enemy);
++
 +/* the player's living enemies near Kevin, nearest first, and whether he can
 +see each */
 +static void companion_look_around(
@@ -2431,6 +2479,10 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	real_point3d eye;
 +	real_point3d origin;
 +
++	companion_update_combat_profile(unit_index);
++	if (game_time_get() < companion_body.enemy_scan_time) return;
++	companion_body.enemy_scan_time = game_time_get() + MAX(1, TICKS_PER_SECOND / 5);
++	companion_body.combat_metrics.scans++;
 +	unit_get_camera_position(unit_index, &eye);
 +	object_get_origin(unit_index, &origin);
 +	companion_enemy_count = 0;
@@ -2452,12 +2504,13 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +		}
 +		object_get_origin(iterator.index, &enemy_origin);
 +		enemy.distance = distance3d(&origin, &enemy_origin);
-+		if (enemy.distance > COMPANION_ENEMY_DISTANCE)
++		if (enemy.distance > companion_body.combat.vision)
 +			continue;
 +
 +		enemy.unit_index = iterator.index;
 +		enemy.aim_point = unit->object.bounding_sphere_center;
-+		enemy.visible = companion_can_see(&eye, iterator.index, unit_index);
++		enemy.visible = FALSE;
++		if (companion_enemy_in_view(unit_index, &enemy)) companion_refresh_enemy(unit_index, &enemy);
 +
 +		/* (kept nearest first; the farthest dropped when full) */
 +		for (index = companion_enemy_count; index > 0 && (companion_enemies[index - 1].distance > enemy.distance ||
@@ -2541,30 +2594,278 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +}
 +
 +
-+/* Weapon profiles are intentionally small. Unknown ordinary weapons stay
-+close; explosive/charged area weapons are not autonomous sprint-one attacks. */
-+static real companion_weapon_range(char const *name)
++/* Native actor firing parameters, without constructing actor/prop state.
++The weapon's explicit override wins; otherwise use a loaded Marine variant
++for this weapon. Vision always starts from a Marine's perception definition. */
++static long companion_combat_ticks(real low, real high, long fallback)
 +{
-+	if (strstr(name, "rocket") || strstr(name, "fuel rod") || strstr(name, "fuel_rod") ||
-+		strstr(name, "flame") || strstr(name, "plasma_cannon") || strstr(name, "plasma cannon")) return 0.f;
-+	if (strstr(name, "shotgun")) return 4.f;
-+	if (strstr(name, "sniper")) return 25.f;
-+	if (strstr(name, "assault") || strstr(name, "plasma rifle") || strstr(name, "plasma_rifle")) return 12.f;
-+	if (strstr(name, "pistol")) return 10.f;
-+	if (strstr(name, "needler")) return 8.f;
-+	return 4.f;
++	real mean = (low + high) * 0.5f;
++
++	return low >= 0.f && high >= low && mean <= 10.f ? (long)(mean * TICKS_PER_SECOND) : fallback;
++}
++
++static void companion_update_combat_profile(long unit_index)
++{
++	struct companion_combat_profile *profile = &companion_body.combat;
++	struct unit_datum *unit = unit_get(unit_index);
++	long weapon_index = unit_inventory_get_weapon(unit_index, unit->unit.current_weapon_index);
++	struct weapon_definition *weapon = weapon_index != NONE ? weapon_definition_get(weapon_get(weapon_index)->definition_index) : NULL;
++	struct actor_variant_definition *firing = NULL;
++	struct actor_definition *marine = NULL;
++	struct tag_iterator iterator;
++	long tag;
++
++	if (profile->initialized && profile->weapon_index == weapon_index)
++		return;
++	csmemset(profile, 0, sizeof(*profile));
++	profile->initialized = TRUE;
++	companion_body.target_blocked_since = 0;
++	companion_body.target_blocked_index = NONE;
++	profile->weapon_index = weapon_index;
++	profile->vision = 25.f;
++	profile->peripheral = 10.f;
++	profile->central_angle = 1.04719755f;
++	profile->transition_angle = 1.57079633f;
++	profile->central_cosine = 0.5f;
++	profile->peripheral_cosine = -0.5f;
++	profile->burst_ticks = COMPANION_BURST_ON_TICKS;
++	profile->pause_ticks = COMPANION_BURST_OFF_TICKS;
++	profile->reaction_ticks = COMPANION_REACTION_TICKS;
++	profile->lead = 1.f;
++	companion_body.target_time = companion_body.burst_time = game_time_get();
++	companion_body.enemy_scan_time = game_time_get();
++	companion_body.combat_metrics.profiles++;
++	tag_iterator_new(&iterator, ACTOR_VARIANT_DEFINITION_TAG);
++	while ((tag = tag_iterator_next(&iterator)) != NONE)
++	{
++		struct actor_variant_definition *variant = actor_variant_definition_get(tag);
++		struct actor_definition *actor;
++
++		if (variant->actor_reference.index == NONE)
++			continue;
++		actor = actor_definition_get(variant->actor_reference.index);
++		if (actor->type != _actor_marine)
++			continue;
++		if (!marine) { marine = actor; firing = variant; }
++		if (weapon && variant->ranged_combat.reference.index == weapon_get(weapon_index)->definition_index)
++		{
++			marine = actor;
++			firing = variant;
++			break;
++		}
++	}
++	if (marine && marine->perception.maximum_vision_distance > 0.f)
++	{
++		profile->vision = marine->perception.maximum_vision_distance;
++		profile->peripheral = MAX(0.f, marine->perception.peripheral_distance);
++		profile->central_angle = marine->perception.central_vision_angle;
++		profile->transition_angle = marine->perception.maximum_vision_angle;
++		profile->central_cosine = (real)cos(profile->central_angle);
++		profile->peripheral_cosine = (real)cos(marine->perception.peripheral_vision_angle);
++	}
++	if (!weapon || weapon->weapon.triggers.count <= 0)
++		return;
++	if (weapon->weapon.ai_firing_parameters.index != NONE)
++		firing = actor_variant_definition_get(weapon->weapon.ai_firing_parameters.index);
++	if (firing)
++	{
++		struct actor_ranged_combat_properties *ranged = &firing->ranged_combat;
++
++		if (ranged->modified_vision_range > 0.f) profile->vision = ranged->modified_vision_range;
++		profile->range = MAX(0.f, ranged->maximum_firing_range);
++		profile->lead = PIN(ranged->target_lead_fraction, 0.f, 1.f);
++		profile->burst_ticks = MAX(1, companion_combat_ticks(ranged->burst_geometry.burst_duration_lower_bound,
++			ranged->burst_geometry.burst_duration_upper_bound, profile->burst_ticks));
++		profile->pause_ticks = MAX(1, companion_combat_ticks(ranged->burst_geometry.burst_separation_lower_bound,
++			ranged->burst_geometry.burst_separation_upper_bound, profile->pause_ticks));
++		profile->reaction_ticks = companion_combat_ticks(ranged->first_burst_delay_lower_bound,
++			ranged->first_burst_delay_upper_bound, profile->reaction_ticks);
++	}
++	{
++		struct weapon_trigger_definition *trigger = TAG_BLOCK_GET_ELEMENT(&weapon->weapon.triggers, 0, struct weapon_trigger_definition);
++		struct projectile_definition *projectile;
++
++		if (trigger->projectile.index == NONE || trigger->charging_time > 0.f ||
++			(trigger->flags & (FLAG(_weapon_trigger_toggles_bit) | FLAG(_weapon_trigger_uses_weapon_origin_bit) |
++			FLAG(_weapon_trigger_projectiles_cannot_be_aimed_bit))))
++			return;
++		projectile = projectile_definition_get(trigger->projectile.index);
++		if (!(projectile->projectile.initial_velocity > 0.f) || projectile->projectile.air_gravity_scale > 0.f ||
++			projectile->projectile.danger_radius > 0.f || projectile->projectile.super_detonation.index != NONE ||
++			projectile->projectile.attached_detonation_damage.index != NONE ||
++			TEST_FLAG(projectile->projectile.flags, 3)) /* native super-combining projectile flag */
++			return;
++		if (projectile->projectile.impact_damage.index != NONE &&
++			damage_effect_definition_get(projectile->projectile.impact_damage.index)->cutoff_radius > 0.f)
++			return;
++		if (!firing) profile->range = projectile->projectile.air_damage_range_upper_bound;
++		if (!(profile->range > 0.f)) profile->range = projectile->projectile.maximum_range;
++		if (projectile->projectile.maximum_range > 0.f)
++			profile->range = MIN(profile->range, projectile->projectile.maximum_range);
++		profile->range = MIN(profile->range, profile->vision);
++		profile->minimum = MAX(0.f, weapon->weapon.ai_minimum_target_range);
++		profile->spread = MAX(0.04f, (real)tan(MIN(trigger->projectile_error_angle_upper_bound +
++			trigger->projectile_distribution_angle, 1.f)));
++		profile->radius = MAX(0.f, projectile->projectile.collision_radius);
++		profile->rate = MAX(trigger->initial_rate_of_fire, trigger->final_rate_of_fire);
++		profile->latched = TEST_FLAG(trigger->flags, _weapon_trigger_latched_bit);
++		profile->supported = profile->range > profile->minimum && profile->rate > 0.f;
++		companion_body.burst_time = game_time_get() + profile->reaction_ticks;
++	}
 +}
 +
 +static real companion_engagement_range(long unit_index)
 +{
-+	struct unit_datum *unit = unit_get(unit_index);
-+	long weapon = unit_inventory_get_weapon(unit_index, unit->unit.current_weapon_index);
-+
-+	return weapon == NONE ? 0.f : companion_weapon_range(tag_name_strip_path(tag_get_name(weapon_get(weapon)->definition_index)));
++	companion_update_combat_profile(unit_index);
++	return companion_body.combat.supported ? companion_body.combat.range : 0.f;
 +}
 +
-+/* Test the cone along BOTH the intended target line and actual current aim.
-+Sight blockers alone omit bipeds, including Chief. */
++/* Native awareness distinguishes recent damage and retains an active target.
++Read only four existing attacker records per victim, not a new enemy scan. */
++static short companion_recent_threat(long enemy_index)
++{
++	long victims[2];
++	short victim;
++
++	victims[0] = companion_unit_index;
++	victims[1] = companion_player_unit();
++	for (victim = 0; victim < 2; victim++)
++	{
++		struct unit_datum *unit = victims[victim] == NONE ? NULL : unit_try_and_get(victims[victim]);
++		short index;
++
++		if (!unit) continue;
++		for (index = 0; index < MAXIMUM_ATTACKERS_PER_UNIT; index++)
++		{
++			struct unit_attacker const *attacker = &unit->unit.attackers[index];
++			if (attacker->object_index == enemy_index && attacker->game_time_stamp != (unsigned long)NONE &&
++				attacker->damage_inflicted > 0.f && (unsigned long)game_time_get() >= attacker->game_time_stamp &&
++				(unsigned long)game_time_get() - attacker->game_time_stamp <= 3 * TICKS_PER_SECOND)
++				return victim ? 1 : 2;
++		}
++	}
++	return 0;
++}
++
++/* Soldiers test target body/head positions; a visible sphere edge is not a
++valid center aim point. Store the actual collision-confirmed point instead. */
++static boolean companion_refresh_enemy(long unit_index, struct companion_enemy *enemy)
++{
++	struct unit_datum *target = unit_try_and_get(enemy->unit_index);
++	real_point3d eye;
++	real_point3d origin;
++	real_point3d point;
++	short sample;
++
++	enemy->visible = FALSE;
++	if (!target || !companion_unit_alive(enemy->unit_index) ||
++		!companion_enemy_team(unit_get(unit_index)->object.owner_team_index, target->object.owner_team_index))
++		return FALSE;
++	unit_get_camera_position(unit_index, &eye);
++	object_get_origin(unit_index, &origin);
++	enemy->distance = distance3d(&origin, &target->object.bounding_sphere_center);
++	for (sample = 0; sample < 2; sample++)
++	{
++		struct collision_result collision;
++
++		if (!sample) unit_get_center_of_mass(enemy->unit_index, &point);
++		else if (target->object.type == _object_type_biped) unit_get_head_position(enemy->unit_index, &point);
++		else break;
++		companion_body.combat_metrics.visibility++;
++		if (!collision_test_line(FLAG(_collision_test_structure_bit) | FLAG(_collision_test_front_facing_surfaces_bit) |
++			FLAG(_collision_test_back_facing_surfaces_bit) | FLAG(_collision_test_objects_bit) |
++			_collision_test_objects_sight_blocking_flags, &eye, &point, unit_index, &collision) ||
++			(collision.type == _collision_result_object && collision.object_index == enemy->unit_index))
++		{
++			enemy->aim_point = point;
++			enemy->visible = TRUE;
++			return TRUE;
++		}
++	}
++	return FALSE;
++}
++
++static boolean companion_enemy_in_view(long unit_index, struct companion_enemy const *enemy)
++{
++	real_point3d eye;
++	real_vector3d to;
++	real_vector3d facing = unit_get(unit_index)->object.forward;
++	real cosine;
++	struct companion_combat_profile const *profile = &companion_body.combat;
++
++	if (enemy->distance > profile->vision) return FALSE;
++	if (enemy->unit_index == companion_body.target_unit_index || companion_recent_threat(enemy->unit_index)) return TRUE;
++	unit_get_camera_position(unit_index, &eye);
++	vector_from_points3d(&eye, &enemy->aim_point, &to);
++	to.k = facing.k = 0.f;
++	if (normalize3d(&to) < 0.001f || normalize3d(&facing) < 0.001f) return TRUE;
++	cosine = dot_product3d(&to, &facing);
++	if (cosine >= profile->central_cosine) return TRUE;
++	if (cosine < profile->peripheral_cosine) return FALSE;
++	{
++		real angle = (real)acos(PIN(cosine, -1.f, 1.f));
++		real limit = profile->peripheral;
++
++		/* actor_get_vision_distances' partial-distance interpolation. Its
++		January view calls the first field maximum_angle and the next
++		central_angle; use their actual offsets in actor_perception_properties. */
++		if (angle < profile->transition_angle && profile->transition_angle > profile->central_angle)
++		{
++			real fraction = (angle - profile->central_angle) / (profile->transition_angle - profile->central_angle);
++			limit = profile->vision + (profile->peripheral - profile->vision) * fraction;
++		}
++		return enemy->distance <= limit;
++	}
++}
++
++/* Follow trigger_create_projectiles for Kevin's actor-less third-person gun.
++Fail closed when no marker exists. Do not guess a firing origin from his eye. */
++static boolean companion_firing_origin(long unit_index, long weapon_index, real_vector3d const *aim, real_point3d *origin)
++{
++	struct object_marker marker;
++	struct weapon_datum *weapon = weapon_get(weapon_index);
++	struct unit_definition *definition = unit_definition_get(unit_get(unit_index)->definition_index);
++	long effect = TEST_FLAG(weapon->object.flags, _object_invisible_bit) && weapon->object.parent_object_index != NONE ?
++		weapon->object.parent_object_index : weapon_index;
++	real_vector3d direction = *aim;
++	real velocity;
++
++	if (!object_get_marker_by_name(effect, "primary trigger", &marker, 1)) return FALSE;
++	*origin = marker.matrix.position;
++	unit_adjust_projectile_ray(unit_index, origin, &direction, &velocity,
++		TEST_FLAG(definition->unit.flags, _unit_fires_from_camera_bit), FALSE);
++	return TRUE;
++}
++
++static boolean companion_aim_solution(long unit_index, struct companion_enemy const *enemy, struct companion_shot *shot)
++{
++	struct companion_combat_profile *profile = &companion_body.combat;
++	struct unit_datum *target;
++	real ticks;
++	real distance;
++	boolean linear = FALSE;
++	long moving;
++
++	if (!enemy || !enemy->visible || !profile->supported) return FALSE;
++	target = unit_get(enemy->unit_index);
++	if (!companion_firing_origin(unit_index, profile->weapon_index, &companion_body.aim, &shot->origin)) return FALSE;
++	distance = distance3d(&shot->origin, &enemy->aim_point);
++	ticks = weapon_estimate_time_to_target(profile->weapon_index, 0, distance);
++	/* Native estimates and object velocities are both in simulation ticks. */
++	if (!(ticks >= 0.f && ticks <= 2.f * TICKS_PER_SECOND)) return FALSE;
++	moving = target->object.parent_object_index != NONE ? target->object.parent_object_index : enemy->unit_index;
++	point_from_line3d(&enemy->aim_point, &object_get(moving)->object.translational_velocity,
++		ticks * profile->lead, &shot->target);
++	companion_body.combat_metrics.aims++;
++	if (!weapon_aim(profile->weapon_index, 0, &shot->origin, &shot->target, FALSE,
++		&shot->aim, NULL, &shot->distance, &linear) || !linear ||
++		!(shot->distance >= profile->minimum && shot->distance <= profile->range) ||
++		!(normalize3d(&shot->aim) > 0.99f)) return FALSE;
++	return TRUE;
++}
++
++/* Test the cone along BOTH intended and actual firing rays, in one fresh
++friendly scan. The spread envelope is safety margin, never extra aim error. */
 +static boolean companion_friendly_cone(real_point3d const *eye, real_vector3d const *along,
 +	real distance, real_point3d const *centre, real radius, real spread)
 +{
@@ -2574,66 +2875,62 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +
 +	vector_from_points3d(eye, centre, &relative);
 +	projection = dot_product3d(&relative, along);
-+	if (projection < -radius || projection > distance + radius)
-+		return FALSE;
++	if (projection < -radius || projection > distance + radius) return FALSE;
 +	squared = dot_product3d(&relative, &relative) - projection * projection;
 +	radius += 0.1f + MAX(0.f, projection) * spread;
 +	return squared < radius * radius;
 +}
 +
-+static boolean companion_safe_shot(long unit_index, struct companion_enemy const *enemy, boolean actual_aim)
++static boolean companion_safe_shot(long unit_index, struct companion_enemy const *enemy, struct companion_shot const *shot)
 +{
 +	struct object_iterator iterator;
 +	struct unit_datum *other;
-+	real_point3d eye;
-+	real_vector3d along;
-+	struct collision_result collision;
-+	real spread = 0.04f;
-+	long weapon;
-+	struct unit_datum *unit = unit_get(unit_index);
++	real_vector3d actual;
++	real_point3d actual_origin;
++	short ray;
++	struct companion_combat_profile const *profile = &companion_body.combat;
 +
 +	if (!enemy || !enemy->visible || !companion_unit_alive(enemy->unit_index) ||
-+		!companion_enemy_team(unit->object.owner_team_index, unit_get(enemy->unit_index)->object.owner_team_index))
++		!companion_enemy_team(unit_get(unit_index)->object.owner_team_index, unit_get(enemy->unit_index)->object.owner_team_index))
 +		return FALSE;
-+	unit_get_camera_position(unit_index, &eye);
-+	if (collision_test_line(FLAG(_collision_test_structure_bit) | FLAG(_collision_test_front_facing_surfaces_bit) |
-+		FLAG(_collision_test_objects_bit) | _collision_test_objects_all_types_flags,
-+		&eye, &enemy->aim_point, unit_index, &collision) &&
-+		(collision.type != _collision_result_object || collision.object_index != enemy->unit_index))
-+		return FALSE;
-+	vector_from_points3d(&eye, &enemy->aim_point, &along);
-+	normalize3d(&along);
-+	if (actual_aim) along = companion_body.aim;
-+	weapon = unit_inventory_get_weapon(unit_index, unit->unit.current_weapon_index);
-+	if (weapon != NONE)
++	unit_get_aiming_vector(unit_index, &actual);
++	if (!(normalize3d(&actual) > 0.99f) ||
++		!companion_firing_origin(unit_index, profile->weapon_index, &actual, &actual_origin)) return FALSE;
++	for (ray = 0; ray < 2; ray++)
 +	{
-+		struct weapon_definition *definition = weapon_definition_get(weapon_get(weapon)->definition_index);
-+		if (definition->weapon.triggers.count > 0)
-+		{
-+			struct weapon_trigger_definition *trigger = TAG_BLOCK_GET_ELEMENT(&definition->weapon.triggers, 0,
-+				struct weapon_trigger_definition);
-+			spread = MAX(spread, (real)tan(MIN(trigger->projectile_error_angle_upper_bound +
-+				trigger->projectile_distribution_angle, 1.f)));
-+		}
++		real_point3d end;
++		struct collision_result collision;
++		real_point3d const *origin = ray ? &actual_origin : &shot->origin;
++		real_vector3d const *aim = ray ? &actual : &shot->aim;
++
++		point_from_line3d(origin, aim, shot->distance, &end);
++		companion_body.combat_metrics.rays++;
++		if (collision_test_line(FLAG(_collision_test_structure_bit) | FLAG(_collision_test_front_facing_surfaces_bit) |
++			FLAG(_collision_test_back_facing_surfaces_bit) | FLAG(_collision_test_objects_bit) | _collision_test_objects_all_types_flags,
++			origin, &end, unit_index, &collision) &&
++			(collision.type != _collision_result_object || collision.object_index != enemy->unit_index)) return FALSE;
 +	}
++	companion_body.combat_metrics.friends++;
 +	object_iterator_new(&iterator, _object_mask_unit, 0);
 +	while ((other = (struct unit_datum *)object_iterator_next(&iterator)) != NULL)
 +	{
 +		if (iterator.index == unit_index || iterator.index == enemy->unit_index ||
 +			TEST_FLAG(other->object.damage_flags, _object_dead_bit) ||
-+			companion_enemy_team(unit->object.owner_team_index, other->object.owner_team_index))
-+			continue;
-+		if (companion_friendly_cone(&eye, &along, enemy->distance,
-+			&other->object.bounding_sphere_center, other->object.bounding_sphere_radius, spread))
-+			return FALSE;
++			companion_enemy_team(unit_get(unit_index)->object.owner_team_index, other->object.owner_team_index)) continue;
++		if (companion_friendly_cone(&shot->origin, &shot->aim, shot->distance,
++			&other->object.bounding_sphere_center, other->object.bounding_sphere_radius + profile->radius, profile->spread) ||
++			companion_friendly_cone(&actual_origin, &actual, shot->distance,
++			&other->object.bounding_sphere_center, other->object.bounding_sphere_radius + profile->radius, profile->spread)) return FALSE;
 +	}
 +	return TRUE;
 +}
 +
 +static boolean companion_target_eligible(struct companion_enemy const *enemy, real range)
 +{
-+	return enemy && enemy->visible && enemy->distance <= range &&
-+		companion_safe_shot(companion_unit_index, enemy, FALSE);
++	return enemy && enemy->visible && enemy->distance <= range && enemy->distance >= companion_body.combat.minimum &&
++		!(enemy->unit_index == companion_body.target_blocked_index && game_time_get() < companion_body.target_blocked_until) &&
++		companion_unit_alive(enemy->unit_index) && companion_enemy_team(unit_get(companion_unit_index)->object.owner_team_index,
++		unit_get(enemy->unit_index)->object.owner_team_index);
 +}
 +
 +static void companion_update_target(long unit_index)
@@ -2646,6 +2943,7 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	short index;
 +	char const *reason = "no valid target";
 +
++	companion_body.combat_metrics.decisions++;
 +	if (!companion_body.hold_fire)
 +	{
 +		if (companion_target_eligible(current, range))
@@ -2658,11 +2956,29 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +					chosen = &companion_enemies[index];
 +					break;
 +				}
-+			if (current && !current->visible && current->distance <= range && !chosen)
++			if (current && companion_unit_alive(current->unit_index) &&
++				companion_enemy_team(unit_get(unit_index)->object.owner_team_index, unit_get(current->unit_index)->object.owner_team_index) &&
++				!current->visible && current->distance <= range && !chosen)
 +			{
 +				if (!companion_body.target_lost_time) companion_body.target_lost_time = now;
 +				if (now - companion_body.target_lost_time < 3 * TICKS_PER_SECOND / 4)
 +					chosen = current;
++			}
++		}
++	}
++	if (chosen && now - companion_body.target_time >= TICKS_PER_SECOND / 2)
++	{
++		short priority = companion_recent_threat(chosen->unit_index);
++		for (index = 0; index < companion_enemy_count; index++)
++		{
++			struct companion_enemy *candidate = &companion_enemies[index];
++			short threat = companion_recent_threat(candidate->unit_index);
++
++			if (companion_target_eligible(candidate, range) && (threat > priority ||
++				(threat == priority && candidate->distance * 2.f < chosen->distance)))
++			{
++				chosen = candidate;
++				priority = threat;
 +			}
 +		}
 +	}
@@ -2671,7 +2987,8 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	if (old != companion_body.target_unit_index)
 +	{
 +		companion_body.target_time = now;
-+		companion_body.burst_time = now;
++		companion_body.target_blocked_since = 0;
++		companion_body.burst_time = now + companion_body.combat.reaction_ticks;
 +		companion_body.target_lost_time = 0;
 +		reason = chosen ? old == NONE ? "enemy acquired" : "target switched" :
 +			current && current->distance > range ? "out of range" : "enemy lost";
@@ -2694,8 +3011,98 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +{
 +	long period = MAX(2, (long)(TICKS_PER_SECOND / MAX(rate, 1.f)));
 +
-+	if (latched) return elapsed % period == 0;
-+	return elapsed % (COMPANION_BURST_ON_TICKS + COMPANION_BURST_OFF_TICKS) < COMPANION_BURST_ON_TICKS;
++	long on = companion_body.combat.burst_ticks > 0 ? companion_body.combat.burst_ticks : COMPANION_BURST_ON_TICKS;
++	long off = companion_body.combat.pause_ticks > 0 ? companion_body.combat.pause_ticks : COMPANION_BURST_OFF_TICKS;
++	long phase = elapsed % (on + off);
++
++	if (phase >= on) return FALSE;
++	return !latched || phase % period == 0;
++}
++
++/* Brief ally crossings cancel fire immediately without target jitter. A
++persistently unusable solution gets a bounded cooldown so another visible
++threat can be selected; this never creates a combat movement order. */
++static void companion_blocked_target(long target_index)
++{
++	long now = game_time_get();
++
++	if (!companion_body.target_blocked_since) companion_body.target_blocked_since = now;
++	if (now - companion_body.target_blocked_since >= 3 * TICKS_PER_SECOND / 4)
++	{
++		companion_body.target_blocked_index = target_index;
++		companion_body.target_blocked_until = now + TICKS_PER_SECOND;
++		companion_body.target_blocked_since = 0;
++	}
++}
++
++static boolean companion_reload_needed(long weapon_index)
++{
++	struct weapon_datum *weapon;
++	struct weapon_definition *definition;
++	struct weapon_trigger_definition *trigger;
++	short magazine;
++
++	if (weapon_index == NONE) return FALSE;
++	weapon = weapon_get(weapon_index);
++	definition = weapon_definition_get(weapon->definition_index);
++	if (definition->weapon.triggers.count <= 0 || weapon->weapon.state >= _weapon_state_primary_reload) return FALSE;
++	trigger = TAG_BLOCK_GET_ELEMENT(&definition->weapon.triggers, 0, struct weapon_trigger_definition);
++	magazine = trigger->magazine_index;
++	return magazine >= 0 && magazine < definition->weapon.magazines.count &&
++		weapon->weapon.magazines[magazine].state == _magazine_idle &&
++		weapon->weapon.magazines[magazine].rounds_loaded < MAX(1, trigger->minimum_rounds_loaded_per_shot) &&
++		weapon->weapon.magazines[magazine].rounds_total > 0;
++}
++
++/* A fire request is not a hit: native triggers still handle recoil, rate,
++ammo and heat. Never edit their state to make a shot possible. */
++static boolean companion_fire_requested(long unit_index, struct companion_enemy const *enemy, struct companion_shot const *shot)
++{
++	struct companion_combat_profile const *profile = &companion_body.combat;
++	struct weapon_datum *weapon;
++	struct weapon_definition *definition;
++	struct weapon_trigger_definition *trigger;
++	real_vector3d actual;
++	short magazine;
++
++	if (!profile->supported || companion_body.hold_fire || !enemy || !enemy->visible ||
++		companion_body.act != _companion_act_none || !companion_target_eligible(enemy, profile->range) ||
++		game_time_get() - companion_body.target_time < profile->reaction_ticks ||
++		!companion_trigger_on(game_time_get() - companion_body.burst_time, profile->latched, profile->rate)) return FALSE;
++	weapon = weapon_get(profile->weapon_index);
++	definition = weapon_definition_get(weapon->definition_index);
++	trigger = TAG_BLOCK_GET_ELEMENT(&definition->weapon.triggers, 0, struct weapon_trigger_definition);
++	magazine = trigger->magazine_index;
++	if (weapon->weapon.state >= _weapon_state_primary_reload || TEST_FLAG(weapon->weapon.flags, 0) ||
++		!weapon_can_be_fired(profile->weapon_index)) return FALSE; /* native overheated bit */
++	if (magazine >= 0 && magazine < definition->weapon.magazines.count &&
++		(weapon->weapon.magazines[magazine].state != _magazine_idle ||
++			weapon->weapon.magazines[magazine].rounds_loaded < MAX(1, trigger->minimum_rounds_loaded_per_shot))) return FALSE;
++	unit_get_aiming_vector(unit_index, &actual);
++	if (dot_product3d(&companion_body.aim, &shot->aim) < 0.999f || dot_product3d(&actual, &shot->aim) < 0.999f) return FALSE;
++	if (!companion_safe_shot(unit_index, enemy, shot))
++	{
++		companion_body.combat_metrics.blocked++;
++		companion_blocked_target(enemy->unit_index);
++		return FALSE;
++	}
++	companion_body.target_blocked_since = 0;
++	companion_body.combat_metrics.requests++;
++	return TRUE;
++}
++
++static void companion_combat_report(void)
++{
++	struct companion_combat_metrics *m = &companion_body.combat_metrics;
++	long now = game_time_get();
++
++	if (now < m->report_time) return;
++	if (config_boolean("debug.companion"))
++		platform_log("Kevin combat queries: profiles=%ld scans=%ld visibility=%ld decisions=%ld aims=%ld rays=%ld friends=%ld fire_requests=%ld blocked=%ld range=%.1fm vision=%.1fm supported=%d",
++			m->profiles, m->scans, m->visibility, m->decisions, m->aims, m->rays, m->friends, m->requests, m->blocked,
++			companion_body.combat.range * COMPANION_METRES_PER_UNIT, companion_body.combat.vision * COMPANION_METRES_PER_UNIT, companion_body.combat.supported);
++	csmemset(m, 0, sizeof(*m));
++	m->report_time = now + TICKS_PER_SECOND;
 +}
 +
 +/* ---------- moving */
@@ -2708,7 +3115,7 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	real_point3d const *point)
 +{
 +	real_point3d start;
-+	long start_surface_index = (companion_body.metrics.bsp++, biped_find_pathfinding_surface_index(biped_index, &start));
++	long start_surface_index = companion_navigation_start(biped_index, &start);
 +	real_point2d known;
 +	real_point2d target;
 +	long surface_index;
@@ -2753,11 +3160,13 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +{
 +	struct path_input input;
 +	real_point3d start;
-+	long start_surface_index = (companion_body.metrics.bsp++, biped_find_pathfinding_surface_index(unit_index, &start));
++	long start_surface_index = companion_navigation_start(unit_index, &start);
 +
 +	companion_body.path_valid = FALSE;
 +	companion_body.safety[0].valid = companion_body.safety[1].valid = FALSE;
 +	companion_body.path_time = game_time_get();
++	companion_body.waypoint_test_time = 0;
++	csmemset(&companion_path_debug, 0, sizeof(companion_path_debug));
 +	companion_body.next_path_time = game_time_get() + COMPANION_PATH_TICKS;
 +	if (start_surface_index == NONE || goal_surface_index == NONE)
 +	{
@@ -2766,7 +3175,6 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	}
 +	path_input_new(&input, companion_navigation_radius(unit_index), FALSE, unit_index);
 +	path_input_set_start(&input, &start, start_surface_index);
-+	csmemset(&companion_path_debug, 0, sizeof(companion_path_debug));
 +	path_state_new(&input, &companion_path_state, &companion_path_debug);
 +	path_state_destination(&companion_path_state, &companion_body.goal, goal_surface_index, 0.1f);
 +	if (!(companion_body.metrics.paths++, path_state_find(&companion_path_state)))
@@ -2963,7 +3371,7 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	struct path_result result;
 +	real_point3d start;
 +	real_point3d goal = *point;
-+	long start_surface_index = (companion_body.metrics.bsp++, biped_find_pathfinding_surface_index(unit_index, &start));
++	long start_surface_index = companion_navigation_start(unit_index, &start);
 +	long goal_surface_index = companion_goal_surface(unit_index, &goal);
 +	boolean reachable;
 +
@@ -3078,8 +3486,8 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +
 +
 +/* One support probe, also used for the immediate next step on cached terrain. */
-+static boolean companion_ground_probe(long unit_index, real_point3d const *point,
-+	real above, real below, real_point3d *ground)
++static boolean companion_ground_sample(long unit_index, real_point3d const *point,
++	real above, real below, real_point3d *ground, long *surface)
 +{
 +	struct biped_definition *definition = biped_definition_get(unit_get(unit_index)->definition_index);
 +	real_point3d from = *point;
@@ -3090,17 +3498,79 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	from.z += above;
 +	down.k = -(above + below);
 +	if (!collision_test_vector(FLAG(_collision_test_structure_bit) |
-+		FLAG(_collision_test_front_facing_surfaces_bit), &from, &down, unit_index, &collision) ||
-+		collision.type != _collision_result_structure || collision.surface_index == NONE ||
-+		collision.plane.n.k < definition->biped.runtime_minimum_normal_k)
++		FLAG(_collision_test_front_facing_surfaces_bit), &from, &down, unit_index, &collision))
++	{
++		companion_body.safety_reason = "no structure hit under footprint";
++		companion_body.safety_point = *point;
 +		return FALSE;
++	}
++	if (collision.type != _collision_result_structure || collision.surface_index == NONE ||
++		collision.plane.n.k < definition->biped.runtime_minimum_normal_k)
++	{
++		companion_body.safety_reason = "invalid or steep structure hit";
++		companion_body.safety_point = collision.point;
++		return FALSE;
++	}
 +	*ground = collision.point;
++	if (surface) *surface = collision.surface_index;
 +	return TRUE;
 +}
 +
-+/* Real walkable structure at this height, including the footprint's ledge margin. */
-+static boolean companion_ground(long unit_index, real_point3d const *point,
++static boolean companion_ground_probe(long unit_index, real_point3d const *point,
 +	real above, real below, real_point3d *ground)
++{
++	return companion_ground_sample(unit_index, point, above, below, ground, NULL);
++}
++
++/* A footprint edge can lie inside a wall rather than over a drop. Accept
++that edge only when fixed BSP walls separate it from the supported center at
++both foot and standing-body heights. Never use this for the center sample.
++Low curbs, object contacts and steep ground do not establish this barrier;
++the ordinary capsule sweep still decides whether the body can actually move. */
++static boolean companion_footprint_wall(long unit_index, real_point3d const *ground,
++	real_point3d const *edge, real above, real below, real_point3d *support)
++{
++	struct biped_definition *definition = biped_definition_get(unit_get(unit_index)->definition_index);
++	real_vector3d outward;
++	real_vector3d normal;
++	real_point3d near;
++	short sample;
++
++	vector_from_points3d(ground, edge, &outward);
++	outward.k = 0.f;
++	for (sample = 0; sample < 2; sample++)
++	{
++		real_point3d from = *ground;
++		real_point3d to = *edge;
++		struct collision_result wall;
++
++		from.z += sample ? MAX(0.3f, definition->biped.collision_height_standing - 0.05f) : 0.03f;
++		to.z = from.z;
++		companion_body.metrics.walls++;
++		if (!collision_test_line(FLAG(_collision_test_structure_bit) |
++			FLAG(_collision_test_front_facing_surfaces_bit), &from, &to, unit_index, &wall) ||
++			wall.type != _collision_result_structure || wall.surface_index == NONE ||
++			fabs(wall.plane.n.k) > 0.1f || dot_product3d(&outward, &wall.plane.n) >= -0.001f)
++			return FALSE;
++		if (sample && dot_product3d(&normal, &wall.plane.n) < 0.9f)
++			return FALSE;
++		if (!sample)
++		{
++			near = wall.point;
++			near.x += wall.plane.n.i * 0.015f;
++			near.y += wall.plane.n.j * 0.015f;
++			near.z = ground->z;
++		}
++		normal = wall.plane.n;
++	}
++	/* Require actual floor immediately before the barrier: a wall across
++	a gap must not disguise the unsupported, accessible side of that gap. */
++	return companion_ground_sample(unit_index, &near, above, below, support, NULL);
++}
++
++/* Real walkable structure at this height, including the footprint's ledge margin. */
++static boolean companion_ground_support(long unit_index, real_point3d const *point,
++	real above, real below, real_point3d *ground, long *surface)
 +{
 +	struct biped_definition *definition = biped_definition_get(unit_get(unit_index)->definition_index);
 +	real radius = definition->biped.collision_radius + 0.04f;
@@ -3117,14 +3587,59 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +		if (sample == 2) from.x -= radius;
 +		if (sample == 3) from.y += radius;
 +		if (sample == 4) from.y -= radius;
-+		if (!companion_ground_probe(unit_index, &from, above, below, &support))
-+			return FALSE;
++		if (!companion_ground_sample(unit_index, &from, above, below, &support, sample ? NULL : surface))
++		{
++			if (!sample || !companion_footprint_wall(unit_index, ground, &from, above, below, &support))
++				return FALSE;
++		}
 +		if (!sample)
 +			*ground = support;
 +		else if (fabs(support.z - ground->z) > radius * slope + 0.04f)
++		{
++			companion_body.safety_reason = "footprint elevation difference";
++			companion_body.safety_point = support;
 +			return FALSE;
++		}
 +	}
 +	return TRUE;
++}
++
++static boolean companion_ground(long unit_index, real_point3d const *point,
++	real above, real below, real_point3d *ground)
++{
++	return companion_ground_support(unit_index, point, above, below, ground, NULL);
++}
++
++static boolean companion_walkable_surface(long surface)
++{
++	struct structure_bsp const *structure = global_structure_bsp_get();
++	byte const *surfaces = structure->pathfinding_surfaces.address;
++
++	/* Walkable bit 6 is defined by ai/path_structure_bsp.c. */
++	return surfaces && VALID_INDEX(surface, structure->pathfinding_surfaces.count) &&
++		(surfaces[surface] & FLAG(6));
++}
++
++/* Biped support/pathfinding indices are caches: object-supported bipeds and
++threshold contacts can have NONE while standing over a valid structure floor.
++The ray-confirmed footprint and that face's navigation flag are the authority. */
++static long companion_navigation_start(long unit_index, real_point3d *ground)
++{
++	real_point3d actual;
++	long surface;
++
++	object_get_origin(unit_index, &actual);
++	companion_body.safety_stage = "current footprint";
++	companion_body.safety_reason = "current footprint support";
++	companion_body.safety_point = actual;
++	if (!companion_ground_support(unit_index, &actual, 0.1f, 0.15f, ground, &surface))
++		return NONE;
++	if (!companion_walkable_surface(surface))
++	{
++		companion_body.safety_reason = "current floor has no walkable navigation face";
++		return NONE;
++	}
++	return surface;
 +}
 +
 +static boolean companion_clearance(
@@ -3180,11 +3695,15 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	if (companion_unit_index == NONE || game_time_get() < companion_body.nav_log_time)
 +		return;
 +	object_get_origin(companion_unit_index, &origin);
-+	platform_log("Kevin nav: %s order=%s goal=(%.2f %.2f %.2f) state=%d distance=%.2f failures=%d recovery=%d traverse=%d build=%d",
++	platform_log("Kevin nav: %s order=%s goal=(%.2f %.2f %.2f) state=%d distance=%.2f failures=%d recovery=%d traverse=%d build=%d safety=%s at=(%.3f %.3f %.3f) stage=%s origin=(%.3f %.3f %.3f) waypoint=(%.3f %.3f %.3f)",
 +		reason, companion_order_names[companion_body.order], companion_body.goal.x,
 +		companion_body.goal.y, companion_body.goal.z, companion_body.nav_state,
 +		distance3d(&origin, &companion_body.goal), companion_body.failures, companion_body.recovery,
-+		companion_path_debug.path_traverse_result, companion_path_debug.path_build_result);
++		companion_path_debug.path_traverse_result, companion_path_debug.path_build_result,
++		companion_body.safety_reason ? companion_body.safety_reason : "none",
++		companion_body.safety_point.x, companion_body.safety_point.y, companion_body.safety_point.z,
++		companion_body.safety_stage ? companion_body.safety_stage : "none", origin.x, origin.y, origin.z,
++		companion_body.progress_waypoint.x, companion_body.progress_waypoint.y, companion_body.progress_waypoint.z);
 +	companion_body.nav_log_time = game_time_get() + TICKS_PER_SECOND;
 +}
 +
@@ -3227,9 +3746,9 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	if (now < m->report_time)
 +		return;
 +	if (config_boolean("debug.companion"))
-+		platform_log("Kevin nav queries: corridor=%ld ground=%ld clearance=%ld bsp=%ld paths=%ld reuse=%ld rejected=%ld",
-+			m->corridors, m->ground, m->clearance, m->bsp, m->paths, m->reuse, m->rejected);
-+	m->corridors = m->ground = m->clearance = m->bsp = m->paths = m->reuse = m->rejected = 0;
++		platform_log("Kevin nav queries: corridor=%ld ground=%ld clearance=%ld bsp=%ld paths=%ld reuse=%ld rejected=%ld wall_probes=%ld local_refits=%ld shortcuts=%ld shortened=%ld",
++			m->corridors, m->ground, m->clearance, m->bsp, m->paths, m->reuse, m->rejected, m->walls, m->local_refits, m->shortcuts, m->shortened);
++	m->local_refits = m->shortcuts = m->shortened = m->corridors = m->ground = m->walls = m->clearance = m->bsp = m->paths = m->reuse = m->rejected = 0;
 +	m->report_time = now + TICKS_PER_SECOND;
 +}
 +
@@ -3269,6 +3788,37 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	return fabs(start->z - height) <= 0.04f;
 +}
 +
++/* Use the ray-confirmed destination face, rather than asking a 2D walk to
++infer an unknown face at an exact doorway/triangulation seam. Halo's line test
++has explicit endpoint-surface handling for this case. Both physical support
++and a walkable BSP connection are still required. */
++static boolean companion_surface_transition(real_point3d const *from, long from_surface,
++	real_point3d const *to, long to_surface)
++{
++	struct structure_bsp const *structure = global_structure_bsp_get();
++	real_point2d start;
++	real_point2d end;
++	struct path_collision_result result;
++
++	companion_body.safety_reason = "BSP surface transition";
++	companion_body.safety_point = *to;
++	if (!companion_walkable_surface(from_surface) || !companion_walkable_surface(to_surface))
++	{
++		companion_body.safety_reason = "transition has a nonwalkable navigation face";
++		return FALSE;
++	}
++	start.x = from->x;
++	start.y = from->y;
++	end.x = to->x;
++	end.y = to->y;
++	companion_body.metrics.bsp++;
++	if (structure_test_line2d(structure, FALSE, &start, from_surface, &end, to_surface, &result) ||
++		result.surface_index == NONE || fabs(result.point.x - to->x) > 0.02f ||
++		fabs(result.point.y - to->y) > 0.02f || fabs(result.point.z - to->z) > 0.05f)
++		return FALSE;
++	return TRUE;
++}
++
 +static boolean companion_validate_corridor(long unit_index, real_point3d const *start,
 +	real_vector3d const *along, real reach, real speed, long surface, struct companion_corridor *cache)
 +{
@@ -3290,24 +3840,25 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	{
 +		real_point3d probe = previous;
 +		real_point3d ground;
-+		real_point2d known;
-+		real_point2d point;
 +		long next_surface;
 +
 +		probe.x = start->x + along->i * interval * sample;
 +		probe.y = start->y + along->j * interval * sample;
-+		if (!companion_ground(unit_index, &probe, interval + 0.12f, interval + 0.12f, &ground) ||
-+			fabs(ground.z - previous.z) > interval * 0.8f + 0.08f)
-+			return FALSE;
-+		known.x = previous.x;
-+		known.y = previous.y;
-+		point.x = ground.x;
-+		point.y = ground.y;
-+		companion_body.metrics.bsp++;
-+		next_surface = structure_surface_index_from_point(global_structure_bsp_get(), FALSE,
-+			&known, current_surface, &point);
-+		if (next_surface == NONE || fabs(point.x - ground.x) > 0.02f || fabs(point.y - ground.y) > 0.02f)
-+			return FALSE;
++		companion_body.safety_reason = "corridor support or elevation";
++		companion_body.safety_point = probe;
++		if (!companion_ground_support(unit_index, &probe, interval + 0.12f, interval + 0.12f, &ground, &next_surface) ||
++			fabs(ground.z - previous.z) > interval * 0.8f + 0.08f ||
++			!companion_surface_transition(&previous, current_surface, &ground, next_surface))
++		{
++			/* Cache padding is optional. The entire stopping line and its
++			end margin must already have passed before accepting a prefix. */
++			if ((sample - 1) * interval < reach + 0.02f)
++				return FALSE;
++			count = sample - 1;
++			total = count * interval;
++			companion_body.metrics.shortened++;
++			break;
++		}
 +		cache->heights[sample] = ground.z;
 +		previous = ground;
 +		current_surface = next_surface;
@@ -3335,44 +3886,22 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	struct game_globals_player_information *information = TAG_BLOCK_GET_ELEMENT(
 +		&scenario_get_game_globals()->player_information, 0, struct game_globals_player_information);
 +	real_point3d start;
-+	real_point3d support;
-+	real_point3d actual;
 +	real speed = magnitude2d((real_vector2d const *)&biped->object.translational_velocity);
 +	real acceleration = MAX(information->run_acceleration / TICKS_PER_SECOND, 0.001f);
 +	real reach = MAX(0.4f, speed * speed / (2.f * acceleration) + speed * 2.f + 0.15f);
-+	long surface = (companion_body.metrics.bsp++, biped_find_pathfinding_surface_index(unit_index, &start));
++	long surface;
 +	short corridor;
 +
 +	companion_body.safety_obstructed = FALSE;
-+	/* Pathfinding can retain a projected point. Cache containment must use the
-+	body's actual position, connected back to that known navigation surface. */
-+	object_get_origin(unit_index, &actual);
-+	if (surface != NONE && companion_flat_distance(&start, &actual) > 0.001f)
-+	{
-+		real_point2d known;
-+		real_point2d point;
-+
-+		known.x = start.x;
-+		known.y = start.y;
-+		point.x = actual.x;
-+		point.y = actual.y;
-+		companion_body.metrics.bsp++;
-+		surface = structure_surface_index_from_point(global_structure_bsp_get(), FALSE, &known, surface, &point);
-+		if (surface == NONE || fabs(point.x - actual.x) > 0.02f || fabs(point.y - actual.y) > 0.02f)
-+			return FALSE;
-+	}
-+	start = actual;
-+	if (surface == NONE || biped->biped.support_surface_index == NONE ||
-+		!companion_ground(unit_index, &start, 0.1f, 0.15f, &support))
++	surface = companion_navigation_start(unit_index, &start);
++	if (surface == NONE)
 +		return FALSE;
-+	start = support;
 +	for (corridor = 0; corridor < 2; corridor++)
 +	{
 +		real_vector3d along = corridor ? biped->object.translational_velocity : *direction;
 +		real_point3d next;
 +		real_point3d ground;
-+		real_point2d known;
-+		real_point2d point;
++		long next_surface;
 +		short index;
 +		boolean cached = FALSE;
 +		real step = MAX(speed, COMPANION_RUN_SPEED * companion_body.pace);
@@ -3390,24 +3919,23 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +				companion_body.metrics.reuse++;
 +				break;
 +			}
++		companion_body.safety_stage = corridor ? "velocity corridor" : "requested corridor";
 +		if (!cached && !companion_validate_corridor(unit_index, &start, &along, reach,
 +			MAX(speed, COMPANION_RUN_SPEED * companion_body.pace), surface, &companion_body.safety[corridor]))
 +			return FALSE;
 +		/* Probe immediate support and moving-object clearance even on cache hits. */
 +		point_from_line3d(&start, &along, step, &next);
-+		if (!companion_ground_probe(unit_index, &next, step + 0.12f, step + 0.12f, &ground) ||
++		companion_body.safety_stage = corridor ? "velocity step" : "requested step";
++		companion_body.safety_reason = "next step support or elevation";
++		companion_body.safety_point = next;
++		if (!companion_ground_sample(unit_index, &next, step + 0.12f, step + 0.12f, &ground, &next_surface) ||
 +			fabs(ground.z - start.z) > step * 0.8f + 0.08f)
 +			return FALSE;
-+		known.x = start.x;
-+		known.y = start.y;
-+		point.x = ground.x;
-+		point.y = ground.y;
-+		companion_body.metrics.bsp++;
-+		if (structure_surface_index_from_point(global_structure_bsp_get(), FALSE, &known, surface, &point) == NONE ||
-+			fabs(point.x - ground.x) > 0.02f || fabs(point.y - ground.y) > 0.02f)
++		if (!companion_surface_transition(&start, surface, &ground, next_surface))
 +			return FALSE;
 +		if (!companion_step_clearance(unit_index, &start, &ground))
 +		{
++			companion_body.safety_reason = "body obstruction";
 +			companion_body.safety_obstructed = TRUE;
 +			return FALSE;
 +		}
@@ -3425,6 +3953,106 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +		companion_safety_invalidate();
 +	}
 +	return safe;
++}
++
++/* actor_destination_update's next-leg projection, with a geometric gate
++before dropping any intermediate point. A waypoint missed slightly to one
++side should not make him reverse. Final/partial endpoints are never skipped. */
++static boolean companion_advance_waypoint(long unit_index, real_point3d const *origin)
++{
++	struct path_result *path = &companion_body.path;
++	real_point3d const *point;
++	real_point3d const *next;
++	real_vector3d leg;
++	real_vector3d offset;
++	real length;
++	real projection;
++	real lateral;
++	real distance;
++	real_point3d start;
++	real_point3d end;
++	long start_surface;
++	long end_surface;
++	struct path_collision_result result;
++
++	if (path->step_index < 0 || path->step_index + 1 >= path->step_count)
++		return FALSE;
++	point = &path->steps[(short)path->step_index].point;
++	next = &path->steps[(short)path->step_index + 1].point;
++	distance = companion_flat_distance(origin, point);
++	vector_from_points3d(point, next, &leg);
++	leg.k = 0.f;
++	length = normalize3d(&leg);
++	vector_from_points3d(point, origin, &offset);
++	projection = dot_product3d(&offset, &leg);
++	lateral = fabs(offset.i * leg.j - offset.j * leg.i);
++	if (fabs(origin->z - point->z) > 0.3f || (distance >= 0.2f &&
++		(length < 0.001f || projection < 0.f || lateral >= 0.25f || distance > 0.75f)))
++		return FALSE;
++	if (game_time_get() < companion_body.waypoint_test_time)
++		return FALSE;
++	companion_body.waypoint_test_time = game_time_get() + 3;
++	start_surface = companion_navigation_start(unit_index, &start);
++	if (start_surface == NONE || !companion_ground_sample(unit_index, next, 0.1f, 0.15f, &end, &end_surface) ||
++		!companion_surface_transition(&start, start_surface, &end, end_surface))
++		return FALSE;
++	companion_body.metrics.bsp++;
++	if (structure_test_pill2d(global_structure_bsp_get(), FALSE,
++		(real_point2d const *)&start, start_surface, (real_point2d const *)&end, end_surface,
++		MAX(0.2f, companion_navigation_radius(unit_index)), 0, &result))
++		return FALSE;
++	/* Do not read the pill result on success: the native function can leave
++	parts unset at open side surfaces. Ground/center continuity passed above. */
++	path->step_index++;
++	companion_body.metrics.shortcuts++;
++	companion_body.waypoint_test_time = 0;
++	companion_safety_invalidate();
++	return TRUE;
++}
++
++/* Refit dynamic obstacle detours using Halo's local disc solver. It reads
++only input/debug from path_state; no BSP search or fabricated actor is needed.
++Build into a separate result so failure cannot damage the current route. */
++static boolean companion_refresh_obstacles(long unit_index)
++{
++	struct path_result updated = companion_body.path;
++	struct path_step remaining[MAXIMUM_SMOOTHED_PATH_STEPS];
++	short count = updated.step_count - updated.step_index;
++	short output_count = 0;
++	short index;
++	real_point3d start;
++	long surface;
++	real previous_reach;
++	boolean success;
++
++	if (!companion_body.path_valid || updated.step_index < 0 || count <= 0 ||
++		updated.step_count > MAXIMUM_SMOOTHED_PATH_STEPS || game_time_get() < companion_body.local_path_time)
++		return FALSE;
++	companion_body.local_path_time = game_time_get() + COMPANION_PATH_TICKS;
++	surface = companion_navigation_start(unit_index, &start);
++	if (surface == NONE)
++		return FALSE;
++	for (index = 0; index < count; index++)
++		remaining[index] = updated.steps[updated.step_index + index];
++	path_input_new(&companion_path_state.input, companion_navigation_radius(unit_index), FALSE, unit_index);
++	path_input_set_start(&companion_path_state.input, &start, surface);
++	companion_path_state.debug = NULL;
++	previous_reach = path_obstacle_search_reach;
++	path_obstacle_search_reach = COMPANION_OBSTACLE_REACH;
++	companion_body.metrics.local_refits++;
++	success = path_avoid_obstacles(&companion_path_state, count, remaining,
++		&output_count, updated.steps, &updated.steps_finish_path);
++	path_obstacle_search_reach = previous_reach;
++	if (!success || output_count <= 0 || output_count > MAXIMUM_SMOOTHED_PATH_STEPS)
++		return FALSE;
++	updated.step_count = (char)output_count;
++	updated.step_index = 0;
++	updated.valid = TRUE;
++	companion_body.path = updated;
++	companion_body.path_time = game_time_get();
++	companion_body.waypoint_test_time = 0;
++	companion_safety_invalidate();
++	return TRUE;
 +}
 +
 +static boolean companion_try_jump(long unit_index, real_vector3d const *direction)
@@ -3640,9 +4268,25 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +		to.z += 0.03f;
 +		/* A reopened obstruction, external relocation, or a new destination
 +		can wake safe idle. Do not keep searching the same impossible route. */
-+		if (distance3d(&origin, &companion_body.failure_origin) < 0.5f &&
-+			(companion_body.nav_state != _companion_nav_blocked || !companion_clearance(unit_index, &from, &to)))
-+			return;
++		if (distance3d(&origin, &companion_body.failure_origin) < 0.5f)
++		{
++			if (companion_body.nav_state == _companion_nav_invalid_surface)
++			{
++				real_vector3d retry;
++				real_point3d waypoint = companion_body.goal;
++
++				if (companion_body.path.step_count > 0 && companion_body.path.step_index >= 0 &&
++					companion_body.path.step_index < companion_body.path.step_count)
++					waypoint = companion_body.path.steps[(short)companion_body.path.step_index].point;
++				vector_from_points3d(&origin, &waypoint, &retry);
++				retry.k = 0.f;
++				if (normalize3d(&retry) < 0.001f || !companion_safe_direction(unit_index, &retry))
++					return;
++			}
++			else if (companion_body.nav_state != _companion_nav_blocked ||
++				!companion_clearance(unit_index, &from, &to))
++				return;
++		}
 +		companion_body.recovery = 0;
 +		companion_body.failures = 0;
 +		companion_body.next_path_time = now;
@@ -3717,9 +4361,8 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +		struct path_result *path = &companion_body.path;
 +		real distance;
 +
-+		while (path->step_index < path->step_count - 1 &&
-+			companion_flat_distance(&origin, &path->steps[(short)path->step_index].point) < 0.2f)
-+			path->step_index++;
++		while (companion_advance_waypoint(unit_index, &origin))
++			;
 +		distance = distance3d(&origin, &path->steps[(short)path->step_index].point);
 +		if (distance < 0.1f)
 +		{
@@ -3785,28 +4428,39 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	}
 +	direction->k = 0.f;
 +	normalize3d(direction);
-+	if (!companion_safe_direction(unit_index, direction))
 +	{
-+		companion_body.path_valid = FALSE;
-+		companion_body.safety[0].valid = companion_body.safety[1].valid = FALSE;
-+		companion_body.nav_state = companion_body.safety_obstructed ? _companion_nav_blocked : _companion_nav_invalid_surface;
-+		if (!companion_body.failures)
++		boolean safe = companion_safe_direction(unit_index, direction);
++
++		if (!safe && companion_body.safety_obstructed && companion_refresh_obstacles(unit_index))
 +		{
-+			companion_body.failure_goal = companion_body.desired_goal;
-+			companion_body.failure_origin = origin;
++			vector_from_points3d(&origin, &companion_body.path.steps[0].point, direction);
++			direction->k = 0.f;
++			if (normalize3d(direction) > 0.001f)
++				safe = companion_safe_direction(unit_index, direction);
 +		}
-+		companion_body.failures = MIN(companion_body.failures + 1, 100);
-+		companion_body.recovery = MIN(companion_body.recovery + 1, 4);
-+		companion_body.next_path_time = MAX(companion_body.next_path_time, now + companion_retry_ticks(companion_body.failures));
-+		if (companion_body.failures == 4)
-+			companion_notice("Kevin rejected unsafe terrain repeatedly and is waiting for a safe route.");
-+		companion_navigation_note("terrain or obstruction rejected");
-+		if (companion_body.safety_obstructed && companion_body.recovery >= 2 &&
-+			companion_body.recovery < 4 && companion_try_jump(unit_index, direction))
++		if (!safe)
++		{
++			companion_body.path_valid = FALSE;
++			companion_body.safety[0].valid = companion_body.safety[1].valid = FALSE;
++			companion_body.nav_state = companion_body.safety_obstructed ? _companion_nav_blocked : _companion_nav_invalid_surface;
++			if (!companion_body.failures)
++			{
++				companion_body.failure_goal = companion_body.desired_goal;
++				companion_body.failure_origin = origin;
++			}
++			companion_body.failures = MIN(companion_body.failures + 1, 100);
++			companion_body.recovery = MIN(companion_body.recovery + 1, 4);
++			companion_body.next_path_time = MAX(companion_body.next_path_time, now + companion_retry_ticks(companion_body.failures));
++			if (companion_body.failures == 4)
++				companion_notice("Kevin rejected unsafe terrain repeatedly and is waiting for a safe route.");
++			companion_navigation_note("terrain or obstruction rejected");
++			if (companion_body.safety_obstructed && companion_body.recovery >= 2 &&
++				companion_body.recovery < 4 && companion_try_jump(unit_index, direction))
++				return;
++			*direction = *global_zero_vector3d;
++			companion_body.requested_move = FALSE;
 +			return;
-+		*direction = *global_zero_vector3d;
-+		companion_body.requested_move = FALSE;
-+		return;
++		}
 +	}
 +	if (!companion_body.path_valid)
 +	{
@@ -3879,6 +4533,35 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	companion_body.goal_valid = FALSE;
 +}
 +
++/* Player physics scales local axes with different speeds (bipeds.c).
++Compensate before limiting throttle so enemy-facing strafing/backpedalling
++preserves the world route direction. Aim and movement orders stay separate. */
++static void companion_movement_throttle(long unit_index, real_vector3d const *walk,
++	real_vector3d const *facing, real_vector3d *throttle)
++{
++	struct biped_definition *definition = biped_definition_get(unit_get(unit_index)->definition_index);
++	struct game_globals_player_information *information = TAG_BLOCK_GET_ELEMENT(
++		&scenario_get_game_globals()->player_information, 0, struct game_globals_player_information);
++	real forward = walk->i * facing->i + walk->j * facing->j;
++	real sideways = -walk->i * facing->j + walk->j * facing->i;
++	real forward_speed = forward > 0.f ? information->run_forward_speed : information->run_backward_speed;
++	real sideways_speed = information->run_sideways_speed;
++	real pace = MIN(1.f, magnitude2d((real_vector2d const *)walk));
++
++	if (cinematic_in_progress() || TEST_FLAG(definition->biped.flags, _biped_uses_old_player_physics_bit))
++	{
++		forward_speed = forward > 0.f ? 2.25f : 2.f;
++		sideways_speed = 2.f;
++	}
++	*throttle = *global_zero_vector3d;
++	if (pace < 0.001f || forward_speed <= 0.f || sideways_speed <= 0.f)
++		return;
++	throttle->i = forward / forward_speed;
++	throttle->j = sideways / sideways_speed;
++	normalize3d(throttle);
++	scale_vector3d(throttle, pace, throttle);
++}
++
 +static void companion_control(
 +	long unit_index,
 +	long player_unit_index)
@@ -3895,24 +4578,23 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	real_vector3d walk;
 +	real_vector3d desired;
 +	real_vector3d facing;
-+	real_vector3d left;
 +	unsigned long flags = 0;
-+	long weapon_index;
++	struct companion_shot shot;
++	boolean solution;
 +
++	companion_update_combat_profile(unit_index);
++	if (target) companion_refresh_enemy(unit_index, target);
++	solution = companion_aim_solution(unit_index, target, &shot);
++	if (!solution && target && target->visible && companion_body.combat.supported)
++		companion_blocked_target(target->unit_index);
 +	/* (his own, as any soldier's: a magazine run dry is reloaded, if there's
 +	ammo for it) */
-+	if (companion_body.act == _companion_act_none && held_weapon_index != NONE)
++	if (companion_body.act == _companion_act_none && companion_reload_needed(held_weapon_index))
 +	{
-+		struct weapon_datum *held = weapon_get(held_weapon_index);
-+
-+		if (weapon_definition_get(held->definition_index)->weapon.magazines.count > 0 &&
-+			held->weapon.magazines[0].rounds_loaded == 0 && held->weapon.magazines[0].rounds_total > 0)
-+		{
-+			companion_body.act = _companion_act_reload;
-+			companion_body.act_target_unit_index = NONE;
-+			companion_body.act_time = game_time_get();
-+			act_ticks = 0;
-+		}
++		companion_body.act = _companion_act_reload;
++		companion_body.act_target_unit_index = NONE;
++		companion_body.act_time = game_time_get();
++		act_ticks = 0;
 +	}
 +
 +	if (unit->object.parent_object_index != NONE)
@@ -3924,7 +4606,11 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	act_ticks = game_time_get() - companion_body.act_time;
 +
 +	/* Smooth aim toward the native target; the weapon supplies its own spread. */
-+	if (target && target->visible)
++	if (solution)
++	{
++		desired = shot.aim;
++	}
++	else if (target && target->visible)
 +	{
 +		real_point3d eye;
 +
@@ -3992,7 +4678,6 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	if (magnitude3d(&facing) < 0.01f)
 +		facing = unit->object.forward;
 +	normalize3d(&facing);
-+	cross_product3d(global_up3d, &facing, &left);
 +
 +	/* the one-off action mate chose: a press, or a grenade's throw held */
 +	switch (companion_body.act)
@@ -4016,35 +4701,10 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	if (act_ticks >= COMPANION_GRENADE_TICKS)
 +		companion_body.act = _companion_act_none;
 +
-+	/* Fire only at a currently visible, in-range, safe native target. */
-+	weapon_index = unit_inventory_get_weapon(unit_index, unit->unit.current_weapon_index);
-+	if (weapon_index != NONE && companion_body.act == _companion_act_none)
-+	{
-+		if (target && target->visible &&
-+			game_time_get() - companion_body.target_time >= COMPANION_REACTION_TICKS &&
-+			dot_product3d(&companion_body.aim, &desired) > 0.999f &&
-+			!companion_body.hold_fire && target->distance <= companion_engagement_range(unit_index) &&
-+			companion_safe_shot(unit_index, target, TRUE))
-+		{
-+			struct weapon_definition *definition = weapon_definition_get(weapon_get(weapon_index)->definition_index);
-+			boolean latched = FALSE;
-+			real rate = 5.f;
-+
-+			if (definition->weapon.triggers.count > 0)
-+			{
-+				struct weapon_trigger_definition *trigger = TAG_BLOCK_GET_ELEMENT(&definition->weapon.triggers, 0,
-+					struct weapon_trigger_definition);
-+				latched = TEST_FLAG(trigger->flags, _weapon_trigger_latched_bit);
-+				rate = trigger->initial_rate_of_fire;
-+			}
-+			SET_FLAG(flags, _unit_control_weapon_primary_trigger_bit,
-+				companion_trigger_on(game_time_get() - companion_body.burst_time, latched, rate));
-+		}
-+		else
-+		{
-+			companion_body.burst_time = game_time_get();
-+		}
-+	}
++	/* No model request: the native solution and both fresh firing rays decide. */
++	SET_FLAG(flags, _unit_control_weapon_primary_trigger_bit,
++		solution && companion_fire_requested(unit_index, target, &shot));
++	companion_combat_report();
 +
 +	/* crouching as mate said, and in cover once there */
 +	companion_body.crouch = companion_body.crouching ||
@@ -4059,9 +4719,7 @@ index 0000000000000000000000000000000000000000..81764a653cc2d5d8e451a13406f1c47c
 +	control.weapon_index = weapon_choice;
 +	control.grenade_index = grenade_index;
 +	control.zoom_level = NONE;
-+	control.throttle.i = dot_product3d(&walk, &facing);
-+	control.throttle.j = dot_product3d(&walk, &left);
-+	control.throttle.k = 0.f;
++	companion_movement_throttle(unit_index, &walk, &facing, &control.throttle);
 +	control.primary_trigger = TEST_FLAG(flags, _unit_control_weapon_primary_trigger_bit) ? 1.f : 0.f;
 +	control.facing_vector = facing;
 +	control.aiming_vector = companion_body.aim;
@@ -6686,10 +7344,10 @@ index be0bf6fc138d9c7bfbea6c9a7e2144901bbe46e9..754a6c1adeb8a01ed927778cb2c80eaa
      lines.append(art.port_picture("blank", [
 diff --git a/tools/harness/tests/companion.c b/tools/harness/tests/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3b741c550
+index 0000000000000000000000000000000000000000..9ac8596b550c910f0de738cd0166281d1a913779
 --- /dev/null
 +++ b/tools/harness/tests/companion.c
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,483 @@
 +#include "harness.h"
 +#include <math.h>
 +#define TICKS_PER_SECOND 30
@@ -6710,6 +7368,8 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 +#define _collision_result_structure 2
 +#define _collision_test_for_bipeds_living_flags 7
 +#define _biped_airborne_bit 0
++#define _biped_uses_old_player_physics_bit 1
++#define cinematic_in_progress() 0
 +#define _companion_act_jump 5
 +#define MIN(a,b) ((a)<(b)?(a):(b))
 +#define MAX(a,b) ((a)>(b)?(a):(b))
@@ -6717,17 +7377,21 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 +#define REAL_MAX 1e30f
 +struct path_step { long surface_index; real_point3d point; };
 +struct path_result { boolean valid; boolean steps_finish_path; char step_count,step_index; struct path_step steps[4]; };
-+struct path_input { int unused; };
-+struct path_state { int unused; };
++struct path_input {real pathfinding_radius;long ignore_source_object_index,start_surface_index;real_point3d start_point;};
++struct path_state {struct path_input input;void *debug;};
 +struct path_debug_storage {short path_traverse_result,path_build_result;};
 +static struct path_debug_storage companion_path_debug;
 +struct biped_datum { long definition_index; struct {long parent_object_index; real_vector3d translational_velocity,forward;} object;
 + struct {unsigned flags; long support_surface_index; short jump_recovery_timer, landing;} biped; };
-+struct biped_definition { struct { real collision_radius,runtime_minimum_normal_k,jump_velocity,collision_height_standing; } biped; };
-+struct game_globals_player_information { real run_acceleration; };
++struct biped_definition { struct { real collision_radius,runtime_minimum_normal_k,jump_velocity,collision_height_standing; unsigned flags; } biped; };
++struct game_globals_player_information { real run_acceleration,run_forward_speed,run_backward_speed,run_sideways_speed; };
 +typedef struct {real x,y;} real_point2d;
 +typedef struct {real i,j;} real_vector2d;
 +struct collision_plane { int unused; };
++struct structure_bsp {struct {long count;void *address;} pathfinding_surfaces;};
++struct path_collision_result {boolean collision;real_point3d point;long surface_index,edge_index;real t;};
++static unsigned char walkable_surfaces[3]={64,64,64};
++static struct structure_bsp fake_structure={{3,walkable_surfaces}};
 +struct collision_feature_list {int unused;};
 +#define collision_get_features_in_sphere(...) occupied
 +#define collision_features_test_point(...) occupied
@@ -6742,10 +7406,14 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 +static const real_vector3d zero;
 +static const real_vector3d *global_zero_vector3d=&zero;
 +static real path_obstacle_search_reach,global_gravity=0.004f;
-+static long now,searches,builds,ground_probes,bsp_queries,capsule_sweeps;
-+static boolean occupied,stale_path,floor_contact;
++static long now,searches,builds,ground_probes,bsp_queries,capsule_sweeps,pill_queries,local_refits;
++static boolean blocked_shortcut,dynamic_blocker,local_ok=TRUE,local_empty,local_partial;
++static real_point3d local_start;
++static boolean occupied,stale_path,floor_contact,door_transition,blocked_nav,missing_nav_cache;
 +static boolean search_ok=TRUE,build_ok=TRUE,missing_ground,steep,obstacle,ceiling,block_clearance;
-+static real slope, drop_at=1000.f;
++static real slope, drop_at=1000.f, drop_y=1000.f;
++static real floor_edge=-1000.f, wall_height=1.f, wall_recess, wall_gap;
++static boolean footprint_wall, object_wall, away_wall, unsupported_wall;
 +static short step_count=1;
 +static boolean finishes=TRUE;
 +static real_point3d destination;
@@ -6756,7 +7424,8 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 +#define biped_definition_get(i) (&fake_definition)
 +#define TAG_BLOCK_GET_ELEMENT(a,b,c) (&fake_information)
 +#define scenario_get_game_globals() 0
-+#define global_structure_bsp_get() 0
++#define global_structure_bsp_get() (&fake_structure)
++#define VALID_INDEX(i,n) ((i)>=0&&(i)<(n))
 +#define config_boolean(a) 0
 +static long game_time_get(void) { return now; }
 +static void object_get_origin(long i, real_point3d *p) { *p=origins[i]; }
@@ -6768,27 +7437,55 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 +static real normalize3d(real_vector3d *v){real d=magnitude3d(v);if(d){v->i/=d;v->j/=d;v->k/=d;}return d;}
 +static void scale_vector3d(const real_vector3d *v,real d,real_vector3d *o){o->i=v->i*d;o->j=v->j*d;o->k=v->k*d;}
 +static void point_from_line3d(const real_point3d *p,const real_vector3d *v,real t,real_point3d *o){o->x=p->x+v->i*t;o->y=p->y+v->j*t;o->z=p->z+v->k*t;}
-+static long biped_find_pathfinding_surface_index(long i,real_point3d *p){*p=origins[i];if(stale_path&&i==0)p->x=0;return bodies[i].biped.support_surface_index;}
-+static long structure_surface_index_from_point(long bsp,int ignore,const real_point2d *start,long surface,real_point2d *end){bsp_queries++;return surface;}
-+static long companion_surface_from(long i,const real_point3d *p){return 1;}
-+static long companion_goal_surface(long i,const real_point3d *p){return bodies[i].biped.support_surface_index;}
-+static void path_input_new(struct path_input *p,real r,boolean b,long i){}
-+static void path_input_set_start(struct path_input *p,const real_point3d *s,long i){}
++static long biped_find_pathfinding_surface_index(long i,real_point3d *p){*p=origins[i];if(stale_path&&i==0)p->x=0;return missing_nav_cache?NONE:bodies[i].biped.support_surface_index;}
++static long structure_surface_index_from_point(struct structure_bsp const *bsp,int ignore,const real_point2d *start,long surface,real_point2d *end){
++ bsp_queries++;if(door_transition&&start->x<0.3f&&end->x>=0.3f){end->x=0.3f;return surface;}return surface;
++}
++static boolean structure_test_line2d(struct structure_bsp const *bsp,boolean ignore,const real_point2d *start,long from,const real_point2d *end,long to,struct path_collision_result *result){
++ bsp_queries++;result->point=(real_point3d){end->x,end->y,end->x*slope+(door_transition&&end->x>=0.3f?0.01f:0.f)};
++ result->surface_index=to;result->collision=blocked_nav;
++ if(blocked_nav){result->point.x=start->x;result->surface_index=from;}
++ return result->collision;
++}
++static boolean structure_test_pill2d(struct structure_bsp const *bsp,boolean ignore,const real_point2d *start,long from,const real_point2d *end,long to,real radius,unsigned long flags,struct path_collision_result *result){
++ pill_queries++;return blocked_shortcut;
++}
++static boolean path_avoid_obstacles(struct path_state *state,short count,struct path_step const *input,short *out_count,struct path_step *output,boolean *finishes){
++ local_refits++;local_start=state->input.start_point;
++ if(!local_ok)return FALSE;
++ if(local_empty){*out_count=0;return TRUE;}
++ *out_count=2;output[0]=(struct path_step){1,{local_start.x,local_start.y+0.6f,local_start.z}};output[1]=input[count-1];
++ if(local_partial){*finishes=FALSE;output[1]=(struct path_step){1,{local_start.x+1,local_start.y+0.6f,local_start.z}};}
++ return TRUE;
++}
++static long companion_player_unit(void){return 1;}
++static boolean companion_unit_alive(long i){return i==0||i==1;}
++static void path_input_new(struct path_input *p,real r,boolean b,long i){memset(p,0,sizeof(*p));p->pathfinding_radius=r;p->ignore_source_object_index=i;}
++static void path_input_set_start(struct path_input *p,const real_point3d *s,long i){p->start_point=*s;p->start_surface_index=i;}
 +static void path_state_new(struct path_input *p,struct path_state *s,void *d){}
 +static void path_state_destination(struct path_state *s,const real_point3d *p,long i,real r){destination=*p;}
 +static boolean path_state_find(struct path_state *p){searches++;return search_ok;}
 +static boolean path_state_build_path(struct path_state *s,struct path_result *p){builds++;companion_path_debug.path_build_result=4;p->step_count=step_count;p->step_index=0;p->steps_finish_path=finishes;p->steps[0].point=destination;if(!finishes)p->steps[0].point.x*=0.5f;return build_ok;}
 +static boolean collision_test_vector(long flags,const real_point3d *from,const real_vector3d *v,long ignore,struct collision_result *c){
-+ real z=from->x*slope;
++ real z=from->x*slope+(door_transition&&from->x>=0.3f?0.01f:0.f);
 + ground_probes++;
-+ if(missing_ground || from->x>=drop_at)return FALSE;
++ if(missing_ground || from->x>=drop_at || from->y>=drop_y || from->y<floor_edge)return FALSE;
 + if(z>from->z || z<from->z+v->k)return FALSE;
-+ c->point=*from;c->point.z=z;c->type=2;c->surface_index=1;c->plane.n.k=steep?0.1f:0.9f;return TRUE;
++ c->point=*from;c->point.z=z;c->type=2;c->surface_index=door_transition&&from->x>=0.3f?2:1;c->plane.n.k=steep?0.1f:0.9f;return TRUE;
 +}
-+static boolean collision_test_line(long f,const real_point3d *a,const real_point3d *b,long i,struct collision_result *c){c->plane.n.k=0;return obstacle;}
++static boolean collision_test_line(long f,const real_point3d *a,const real_point3d *b,long i,struct collision_result *c){
++ real wall_y=floor_edge-wall_gap-(a->z>0.15f?wall_recess:0.f);
++ if(footprint_wall && a->z<=wall_height && a->y>=wall_y && b->y<wall_y){
++  real t=(wall_y-a->y)/(b->y-a->y);
++  c->type=object_wall?1:2;c->surface_index=unsupported_wall?NONE:1;
++  c->point=(real_point3d){a->x+(b->x-a->x)*t,wall_y,a->z};
++  c->plane.n=(real_vector3d){0,away_wall?-1:1,0};return TRUE;
++ }
++ c->plane.n.k=0;return obstacle;
++}
 +static void biped_get_physics_pill(long i,real_point3d *p,real *h,real *r){*p=origins[i];p->z+=0.1f;*h=0.5f;*r=0.1f;}
 +static short collision_move_pill(long f,const real_point3d *p,const real_vector3d *v,real h,real r,long i,real_point3d *out,real_vector3d *velocity,short n,struct collision_plane *c){
-+ capsule_sweeps++;point_from_line3d(p,v,1,out);if(block_clearance || (floor_contact && p->z-r < -0.001f) || (ceiling && p->z>0.4f))out->x+=0.1f;return 0;
++ capsule_sweeps++;point_from_line3d(p,v,1,out);if(block_clearance || (dynamic_blocker && out->x>p->x+0.02f && out->y<0.05f) || (floor_contact && p->z-r < -0.001f) || (ceiling && p->z>0.4f))out->x+=0.1f;return 0;
 +}
 +static void companion_navigation_note(const char *s){}
 +static boolean coop_enemies_spread_position(const real_point3d *p,long n,void *unused,real_point3d *out){*out=*p;return TRUE;}
@@ -6798,7 +7495,7 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 + const char *case_name=argv[1];real_vector3d walk={1,0,0};real_point3d goal;
 + memset(&companion_body,0,sizeof(companion_body));
 + fake_definition.biped.collision_radius=0.1f;fake_definition.biped.runtime_minimum_normal_k=0.6f;fake_definition.biped.jump_velocity=0.08f;
-+ fake_information.run_acceleration=0.32f;
++ fake_information.run_acceleration=0.32f;fake_information.run_forward_speed=2.25f;fake_information.run_backward_speed=2.f;fake_information.run_sideways_speed=2.f;fake_definition.biped.collision_height_standing=0.7f;
 + bodies[0].biped.support_surface_index=1;bodies[0].object.parent_object_index=NONE;bodies[0].biped.jump_recovery_timer=10;
 + bodies[1].biped.support_surface_index=1;bodies[1].object.forward.i=1;
 + companion_body.progress_step=NONE;origins[1].x=3;now=30;
@@ -6832,6 +7529,178 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 +  printf("stable 90 ticks: ground=%ld bsp=%ld full=%ld reuse=%ld capsule=%ld\n",ground_probes,bsp_queries,full,reused,capsule_sweeps);
 + }
 +#ifndef BASELINE_COMPANION
++ CASE("padding-prefix"){
++  companion_body.pace=1;drop_at=0.65f;
++  CHECK(companion_safe_direction(0,&walk),"optional cache padding must not reject a fully verified stopping line");
++  CHECK(companion_body.safety[0].reach>=0.42f&&companion_body.safety[0].reach<0.65f-0.14f,"only the safe prefix is cached");
++  origins[0].x=0.10f;
++  CHECK(!companion_safe_direction(0,&walk),"shortened cache cannot authorize movement beyond required safe extent");
++ }
++ CASE("waypoint-overshoot"){
++  companion_body.order=_companion_order_move;companion_body.hold_point=(real_point3d){0,2,0};
++  companion_body.goal_valid=companion_body.path_valid=TRUE;companion_body.goal=companion_body.desired_goal=companion_body.hold_point;
++  companion_body.next_path_time=100;companion_body.path.step_count=2;companion_body.path.steps_finish_path=TRUE;
++  companion_body.path.steps[0]=(struct path_step){1,{0,0,0}};companion_body.path.steps[1]=(struct path_step){1,{0,2,0}};
++  origins[0]=(real_point3d){0.10f,0.28f,0};
++  companion_walk_direction(0,1,NULL,&walk);
++  CHECK(companion_body.path.step_index==1&&walk.j>0.8f,"passed intermediate waypoint advances rather than turning back");
++  CHECK(searches==0,"overshoot does not require a full path search");
++ }
++ CASE("waypoint-corner-blocked"){
++  companion_body.order=_companion_order_move;companion_body.hold_point=(real_point3d){0,2,0};
++  companion_body.goal_valid=companion_body.path_valid=TRUE;companion_body.goal=companion_body.desired_goal=companion_body.hold_point;
++  companion_body.next_path_time=100;companion_body.path.step_count=2;
++  companion_body.path.steps[0]=(struct path_step){1,{0,0,0}};companion_body.path.steps[1]=(struct path_step){1,{0,2,0}};
++  origins[0]=(real_point3d){0.18f,0,0};blocked_shortcut=TRUE;
++  companion_walk_direction(0,1,NULL,&walk);
++  CHECK(companion_body.path.step_index==0,"proximity cannot cut a blocked corridor corner");
++ }
++ CASE("waypoint-bounds"){
++  companion_body.path.step_count=2;companion_body.path.steps[0]=(struct path_step){1,{0,0,0}};
++  companion_body.path.steps[1]=(struct path_step){1,{0,2,0}};origins[0]=(real_point3d){0.3f,0.28f,0};
++  CHECK(!companion_advance_waypoint(0,&origins[0])&&pill_queries==0,"off-route actor cannot jump laterally to next segment");
++  origins[0]=(real_point3d){0.1f,0.28f,0.5f};
++  CHECK(!companion_advance_waypoint(0,&origins[0]),"different elevation cannot count as waypoint overshoot");
++  companion_body.path.step_count=1;origins[0].z=0;
++  CHECK(!companion_advance_waypoint(0,&origins[0]),"final or partial endpoint is not skipped");
++ }
++ CASE("waypoint-ramp"){
++  slope=0.5f;companion_body.path.step_count=2;
++  companion_body.path.steps[0]=(struct path_step){1,{0,0,0}};companion_body.path.steps[1]=(struct path_step){1,{2,0,1}};
++  origins[0]=(real_point3d){0.28f,0.1f,0.14f};
++  CHECK(companion_advance_waypoint(0,&origins[0])&&companion_body.path.step_index==1,"passed ramp point advances on connected supported slope");
++ }
++ CASE("waypoint-invalid-surface"){
++  door_transition=TRUE;walkable_surfaces[2]=0;companion_body.path.step_count=2;
++  companion_body.path.steps[0]=(struct path_step){1,{0,0,0}};companion_body.path.steps[1]=(struct path_step){2,{2,0,0.01f}};
++  origins[0]=(real_point3d){0.28f,0.1f,0};
++  CHECK(!companion_advance_waypoint(0,&origins[0]),"next waypoint must still have walkable ground and a valid BSP connection");
++ }
++ CASE("waypoint-gate-budget"){
++  int tick;companion_body.path.step_count=2;blocked_shortcut=TRUE;
++  companion_body.path.steps[0]=(struct path_step){1,{0,0,0}};companion_body.path.steps[1]=(struct path_step){1,{0,2,0}};
++  origins[0]=(real_point3d){0.18f,0,0};
++  for(tick=0;tick<30;tick++,now++)CHECK(!companion_advance_waypoint(0,&origins[0]),"blocked shortcut stays blocked");
++  CHECK(pill_queries==10,"blocked shortcut geometry checked at most 10 Hz, got %ld",pill_queries);
++ }
++ CASE("dynamic-blocker"){
++  companion_body.order=_companion_order_move;companion_body.hold_point=(real_point3d){3,0,0};companion_body.hold_fire=TRUE;
++  dynamic_blocker=TRUE;companion_walk_direction(0,1,NULL,&walk);
++  CHECK(local_refits==1&&searches==1&&walk.j>0.8f,"new physical blocker gets a native local detour without another full search");
++  CHECK(companion_body.order==_companion_order_move&&companion_body.hold_fire,"detour preserves independent move/fire orders");
++  CHECK(companion_body.progress_time==30&&companion_body.failures==0,"successful local detour does not enter recovery");
++ }
++ CASE("local-refit-budget"){
++  int tick;companion_body.path_valid=TRUE;companion_body.path.step_count=1;
++  companion_body.path.steps[0]=(struct path_step){1,{3,0,0}};local_ok=FALSE;
++  for(tick=0;tick<30;tick++,now++)CHECK(!companion_refresh_obstacles(0),"blocked local solver fails safely");
++  CHECK(local_refits==2&&searches==0,"local refits at most 2 Hz without BSP search");
++ }
++ CASE("local-refit-atomic"){
++  struct path_result old;companion_body.path_valid=TRUE;companion_body.path.step_count=2;companion_body.path.step_index=1;
++  companion_body.path.steps[0]=(struct path_step){1,{-1,0,0}};companion_body.path.steps[1]=(struct path_step){1,{3,0,0}};
++  old=companion_body.path;local_ok=FALSE;path_obstacle_search_reach=7;
++  CHECK(!companion_refresh_obstacles(0)&&memcmp(&old,&companion_body.path,sizeof(old))==0,"failed refit leaves previous route intact");
++  now+=15;local_ok=TRUE;local_empty=TRUE;
++  CHECK(!companion_refresh_obstacles(0)&&memcmp(&old,&companion_body.path,sizeof(old))==0,"empty solver output cannot authorize movement");
++  now+=15;local_empty=FALSE;origins[0].x=0.4f;
++  CHECK(companion_refresh_obstacles(0)&&local_start.x==0.4f,"local solver starts at fresh actual position");
++  CHECK(path_obstacle_search_reach==7,"local search restores prior engine obstacle reach");path_obstacle_search_reach=0;
++ }
++ CASE("local-refit-partial"){
++  companion_body.order=_companion_order_move;companion_body.hold_point=(real_point3d){3,0,0};
++  companion_body.goal_valid=TRUE;companion_body.desired_goal=companion_body.goal=companion_body.hold_point;
++  companion_body.path_valid=TRUE;companion_body.path.step_count=1;companion_body.path.steps[0]=(struct path_step){1,{3,0,0}};
++  local_partial=TRUE;CHECK(companion_refresh_obstacles(0)&&!companion_body.path.steps_finish_path,"preserve native local solver's partial-route status");
++  origins[0]=companion_body.path.steps[1].point;companion_body.path.step_index=1;now+=15;
++  companion_walk_direction(0,1,NULL,&walk);CHECK(!companion_body.path_valid,"partial route endpoint exhausts normally");
++  now+=15;companion_walk_direction(0,1,NULL,&walk);CHECK(searches==1,"full planner continues an exhausted partial local route");
++ }
++ CASE("local-refit-cliff"){
++  companion_body.order=_companion_order_move;companion_body.hold_point=(real_point3d){3,0,0};
++  dynamic_blocker=TRUE;drop_y=0.3f;companion_walk_direction(0,1,NULL,&walk);
++  CHECK(local_refits==1&&magnitude3d(&walk)==0&&!companion_body.path_valid,"native detour still fails unsafe ground and does not move");
++ }
++ CASE("dynamic-blocker-clears"){
++  companion_body.order=_companion_order_move;companion_body.hold_point=(real_point3d){3,0,0};
++  dynamic_blocker=TRUE;local_ok=FALSE;companion_walk_direction(0,1,NULL,&walk);
++  CHECK(magnitude3d(&walk)==0,"no route while doorway occupied");
++  dynamic_blocker=FALSE;now=companion_body.next_path_time;
++  companion_walk_direction(0,1,NULL,&walk);CHECK(walk.i>0.8f&&searches==2,"reopened doorway resumes bounded normal replanning");
++ }
++ CASE("narrow-corridor"){
++  int tick;floor_edge=-0.28f;drop_y=0.28f;fake_definition.biped.collision_radius=0.19f;
++  companion_body.order=_companion_order_move;companion_body.hold_point=(real_point3d){5,0,0};
++  for(tick=0;tick<30;tick++,now++){
++   companion_walk_direction(0,1,NULL,&walk);CHECK(walk.i>0.8f,"supported narrow corridor remains traversable");origins[0].x+=walk.i*0.075f;
++  }
++  CHECK(searches==1&&local_refits==0,"stable corridor needs no route churn or local avoidance");
++ }
++ CASE("aiming-movement"){
++  int i;real angles[]={0,0.78539816f,1.5707963f,2.3561945f,3.1415926f};
++  companion_body.order=_companion_order_move;companion_body.hold_fire=TRUE;walk=(real_vector3d){0.7f,0,0};
++  for(i=0;i<5;i++){
++   real_vector3d face={cosf(angles[i]),sinf(angles[i]),0},throttle;real forward,x,y;
++   companion_movement_throttle(0,&walk,&face,&throttle);
++   forward=throttle.i>0?fake_information.run_forward_speed:fake_information.run_backward_speed;
++   x=throttle.i*forward*face.i-throttle.j*fake_information.run_sideways_speed*face.j;
++   y=throttle.i*forward*face.j+throttle.j*fake_information.run_sideways_speed*face.i;
++   CHECK(x>0&&fabsf(y)<0.00001f,"enemy-facing player physics must stay on world route at heading %d: %f",i,y);
++   CHECK(fabsf(magnitude3d(&throttle)-0.7f)<0.00001f,"throttle pace preserved");
++  }
++  CHECK(companion_body.order==_companion_order_move&&companion_body.hold_fire,"projection does not change orders");
++ }
++ CASE("throttle-old-physics"){
++  real_vector3d face={0.70710678f,0.70710678f,0},throttle;
++  fake_information.run_forward_speed=10;fake_information.run_sideways_speed=1;
++  fake_definition.biped.flags=FLAG(_biped_uses_old_player_physics_bit);
++  companion_movement_throttle(0,&walk,&face,&throttle);
++  CHECK(fabsf(throttle.i*2.25f-throttle.j*-2.f)<0.00001f,"old player physics uses engine's speed overrides");
++  walk=(real_vector3d){0,0,0};companion_movement_throttle(0,&walk,&face,&throttle);
++  CHECK(magnitude3d(&throttle)==0,"idle throttle remains zero");
++ }
++ CASE("wall-footprint-live"){
++  real_point3d ground,probe={-51.749f,35.970f,0};
++  floor_edge=36.0287f;footprint_wall=TRUE;wall_recess=0.05f;
++  fake_definition.biped.collision_radius=0.19f;
++  origins[0]=(real_point3d){-52.069f,36.793f,0};
++  CHECK(!companion_ground_probe(0,&probe,0.22f,0.22f,&ground),"logged probe is inside actual map wall");
++  walk=(real_vector3d){0.320f,-0.593f,0};normalize3d(&walk);companion_body.pace=1;
++  CHECK(companion_safe_direction(0,&walk),"Pillar of Autumn floor with solid wall behind footprint margin");
++ }
++ CASE("wall-parallel"){
++  int tick;floor_edge=0;footprint_wall=TRUE;origins[0].y=0.12f;companion_body.pace=1;
++  for(tick=0;tick<10;tick++,now++){
++   CHECK(companion_safe_direction(0,&walk),"safe supported corridor beside wall");origins[0].x+=0.075f;
++  }
++ }
++ CASE("wall-footprint-cliff"){
++  floor_edge=0;origins[0].y=0.12f;
++  CHECK(!companion_safe_direction(0,&walk),"exposed footprint at cliff still fails");
++  footprint_wall=TRUE;wall_height=0.1f;
++  CHECK(!companion_safe_direction(0,&walk),"low curb cannot hide a cliff");
++  wall_height=1;object_wall=TRUE;
++  CHECK(!companion_safe_direction(0,&walk),"movable object cannot substitute for solid BSP wall");
++  object_wall=FALSE;away_wall=TRUE;
++  CHECK(!companion_safe_direction(0,&walk),"back-facing wall cannot hide missing support");
++  away_wall=FALSE;unsupported_wall=TRUE;
++  CHECK(!companion_safe_direction(0,&walk),"invalid wall face cannot hide missing support");
++  unsupported_wall=FALSE;origins[0].y=-0.01f;
++  CHECK(!companion_safe_direction(0,&walk),"wall never substitutes for floor under center");
++ }
++ CASE("wall-footprint-gap"){
++  floor_edge=0;footprint_wall=TRUE;wall_gap=0.03f;origins[0].y=0.10f;
++  CHECK(!companion_safe_direction(0,&walk),"wall behind an exposed gap cannot hide missing footprint support");
++ }
++ CASE("wall-footprint-obstruction"){
++  floor_edge=0;footprint_wall=TRUE;origins[0].y=0.12f;block_clearance=TRUE;
++  CHECK(!companion_safe_direction(0,&walk)&&companion_body.safety_obstructed,"wall margin cannot bypass actual body collision");
++ }
++ CASE("wall-footprint-jump"){
++  floor_edge=0;footprint_wall=TRUE;origins[0].y=0.12f;obstacle=TRUE;
++  walk=(real_vector3d){0,-1,0};
++  CHECK(!companion_try_jump(0,&walk),"wall margin never authorizes jumping off unsupported center");
++ }
 + CASE("cache-expiry"){
 +  CHECK(companion_safe_direction(0,&walk),"prime");CHECK(companion_body.metrics.corridors==1,"first full validation");
 +  now++;CHECK(companion_safe_direction(0,&walk),"reuse");CHECK(companion_body.metrics.corridors==1,"cached");
@@ -6893,6 +7762,65 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 +  block_clearance=TRUE;
 +  CHECK(!companion_safe_direction(0,&walk),"physical capsule still rejects obstruction");
 + }
++ CASE("doorway-transition"){
++  door_transition=TRUE;companion_body.pace=1;
++  CHECK(companion_safe_direction(0,&walk),"continuous supported doorway seam must remain traversable");
++  origins[0].x=0.32f;origins[0].z=0.01f;
++  CHECK(companion_safe_direction(0,&walk),"fresh floor surface anchors after crossing");
++ }
++ CASE("doorway-follow"){
++  int moving=0;door_transition=TRUE;
++  for(now=30;now<90;now++){
++   origins[1].x+=0.075f;origins[1].z=0.01f;bodies[1].object.translational_velocity.i=0.075f;
++   companion_walk_direction(0,1,NULL,&walk);if(walk.i>0.5f)moving++;
++   origins[0].x+=walk.i*0.075f;origins[0].z=origins[0].x>=0.3f?0.01f:0;
++   if(origins[0].x>=0.3f)bodies[0].biped.support_surface_index=2;
++  }
++  CHECK(moving>=55&&origins[0].x>1,"following continues across doorway threshold: %d ticks",moving);
++ }
++ CASE("missing-support-cache"){
++  bodies[0].biped.support_surface_index=NONE;companion_body.pace=1;
++  CHECK(companion_safe_direction(0,&walk),"a missing biped support cache is not missing actual ground");
++  missing_nav_cache=TRUE;companion_walk_direction(0,1,NULL,&walk);
++  CHECK(searches==1&&walk.i>0.5f,"missing physical and navigation caches do not stop supported following");
++ }
++ CASE("missing-nav-cache"){
++  missing_nav_cache=TRUE;companion_body.pace=1;
++  CHECK(companion_safe_direction(0,&walk),"fresh supported walkable ground replaces missing cached navigation");
++  companion_walk_direction(0,1,NULL,&walk);
++  CHECK(searches==1&&walk.i>0.5f,"path search must use the same verified start");
++ }
++ CASE("missing-cache-cliff"){
++  bodies[0].biped.support_surface_index=NONE;missing_nav_cache=TRUE;drop_at=0.3f;
++  CHECK(!companion_safe_direction(0,&walk),"missing caches cannot bypass a real cliff");
++  missing_ground=TRUE;drop_at=1000;
++  CHECK(!companion_safe_direction(0,&walk),"no actual support remains unsafe");
++ }
++ CASE("terrain-recovery-wake"){
++  companion_body.recovery=4;companion_body.failures=4;companion_body.nav_state=_companion_nav_invalid_surface;
++  companion_body.goal_valid=TRUE;companion_body.goal.x=companion_body.desired_goal.x=2.2f;
++  missing_nav_cache=TRUE;bodies[0].biped.support_surface_index=NONE;
++  companion_walk_direction(0,1,NULL,&walk);
++  CHECK(searches==1&&walk.i>0.5f,"safe floor can wake exhausted terrain recovery without relocation");
++ }
++ CASE("terrain-recovery-cliff"){
++  long probes;
++  companion_body.recovery=4;companion_body.failures=4;companion_body.nav_state=_companion_nav_invalid_surface;
++  companion_body.goal_valid=TRUE;companion_body.goal.x=companion_body.desired_goal.x=2.2f;drop_at=0.2f;
++  companion_walk_direction(0,1,NULL,&walk);
++  CHECK(searches==0&&magnitude3d(&walk)==0,"real cliff does not wake recovery or launch a search");
++  probes=ground_probes;now++;
++  companion_walk_direction(0,1,NULL,&walk);
++  CHECK(ground_probes==probes,"terrain recheck remains rate limited");
++ }
++ CASE("doorway-reject"){
++  door_transition=TRUE;blocked_nav=TRUE;
++  CHECK(!companion_safe_direction(0,&walk),"actual blocked BSP transition remains unsafe");
++  blocked_nav=FALSE;drop_at=0.45f;
++  CHECK(!companion_safe_direction(0,&walk),"a cliff beyond the doorway still rejects movement");
++  drop_at=1000;walkable_surfaces[2]=0;
++  CHECK(!companion_safe_direction(0,&walk),"unsupported navigation surface stays blocked");
++ }
 + CASE("cache-jump"){
 +  CHECK(companion_safe_direction(0,&walk),"prime");obstacle=TRUE;ceiling=TRUE;
 +  CHECK(!companion_try_jump(0,&walk),"cached walk cannot authorize unsafe jump");CHECK(!companion_body.safety[0].valid,"jump invalidates cache");
@@ -6900,18 +7828,23 @@ index 0000000000000000000000000000000000000000..3a333c2713d17b3fafca4875e99e32f3
 + }
 +#endif
 + CASE("teleport"){origins[1].x=50;companion_body.failures=4;companion_catch_up(0,1);CHECK(origins[0].x==0,"no immediate teleport");now+=301;companion_body.order=_companion_order_move;companion_catch_up(0,1);CHECK(origins[0].x==0,"move order never teleports");companion_body.order=_companion_order_follow;companion_catch_up(0,1);CHECK(origins[0].x==50,"last resort");}
-+ CHECK(builds >= 0 && path_obstacle_search_reach == 0.f,"search override restored");
++ CHECK(pill_queries >= 0 && local_refits >= 0 && builds >= 0 && path_obstacle_search_reach == 0.f,"search override restored");
 + return 0;
 +}
 diff --git a/tools/harness/tests/companion_combat.c b/tools/harness/tests/companion_combat.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..524d1a45b45b09c1a1e44fba5f23a76b4258005a
+index 0000000000000000000000000000000000000000..5968397f3b3c67f0b6a48466fe0f0c568ecf179c
 --- /dev/null
 +++ b/tools/harness/tests/companion_combat.c
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,373 @@
 +#include "harness.h"
 +#include <math.h>
++#undef CASE
++#define CASE(name) if (!strcmp(case_name, name) && (++matched))
 +#define TICKS_PER_SECOND 30
++#define COMPANION_REACTION_TICKS 12
++#define COMPANION_MAXIMUM_ENEMIES 12
++#define _companion_act_none 0
 +#define companion_notice(a) ((void)0)
 +#define COMPANION_BURST_ON_TICKS 18
 +#define COMPANION_BURST_OFF_TICKS 9
@@ -6919,77 +7852,337 @@ index 0000000000000000000000000000000000000000..524d1a45b45b09c1a1e44fba5f23a76b
 +#define NUMBER_OF_SOLO_CAMPAIGN_TEAMS 8
 +#define _game_team_default 0
 +#define _object_dead_bit 0
++#define _object_invisible_bit 1
++#define _object_type_biped 0
 +#define _object_mask_unit 1
 +#define _collision_test_structure_bit 0
 +#define _collision_test_front_facing_surfaces_bit 1
 +#define _collision_test_objects_bit 2
++#define _collision_test_back_facing_surfaces_bit 3
++#define _collision_test_objects_sight_blocking_flags 0x10
 +#define _collision_test_objects_all_types_flags 0xf0
 +#define _collision_result_object 1
 +#define _collision_result_structure 2
++#define _unit_fires_from_camera_bit 0
++#define _weapon_trigger_toggles_bit 4
++#define _weapon_trigger_uses_weapon_origin_bit 5
++#define _weapon_trigger_projectiles_cannot_be_aimed_bit 11
++#define _weapon_trigger_latched_bit 3
++#define _weapon_state_primary_reload 5
++#define _magazine_idle 0
++#define MAXIMUM_ATTACKERS_PER_UNIT 4
++#define _actor_marine 7
++#define ACTOR_VARIANT_DEFINITION_TAG 1
 +#define COMPANION_VIEW_REACH 40.f
 +#define cinematic_in_progress() FALSE
 +#define companion_player_unit() 1
 +#define VALID_INDEX(i,n) ((i)>=0&&(i)<(n))
 +#define MIN(a,b) ((a)<(b)?(a):(b))
 +#define MAX(a,b) ((a)>(b)?(a):(b))
++#define PIN(a,b,c) MIN(MAX(a,b),c)
 +static void platform_log(const char *format, ...) {(void)format;}
 +#define csmemset memset
 +#define config_boolean(a) 0
 +struct path_result { int unused; };
-+struct unit_datum {long definition_index;struct {unsigned damage_flags;short owner_team_index;real_point3d bounding_sphere_center;real bounding_sphere_radius;real_vector3d forward;} object;struct {short current_weapon_index;} unit;};
-+struct weapon_trigger_definition {unsigned flags;real projectile_error_angle_upper_bound,projectile_distribution_angle;};
-+struct weapon_definition {struct {struct {short count;} triggers;} weapon;};
-+struct collision_result {short type;long object_index;real_point3d point;struct {real_vector3d n;} plane;};
++struct unit_attacker {unsigned long game_time_stamp;real damage_inflicted;long object_index,player_index;};
++struct unit_datum {long definition_index;struct {unsigned damage_flags,flags;short type,owner_team_index;long parent_object_index;real_point3d bounding_sphere_center;real bounding_sphere_radius;real_vector3d forward,translational_velocity;} object;struct {short current_weapon_index;real_vector3d aiming_vector;struct unit_attacker attackers[4];} unit;};
++struct tag_reference {long index;};
++struct weapon_trigger_definition {unsigned flags;real initial_rate_of_fire,final_rate_of_fire,charging_time,projectile_error_angle_upper_bound,projectile_distribution_angle;short magazine_index,minimum_rounds_loaded_per_shot;struct tag_reference projectile;};
++struct weapon_definition {struct {struct {short count;} triggers,magazines;struct tag_reference ai_firing_parameters;real ai_minimum_target_range;} weapon;};
++struct weapon_datum {long definition_index;struct {unsigned flags;long parent_object_index;} object;struct {short state;unsigned flags;struct {short state,rounds_loaded,rounds_total;} magazines[2];} weapon;};
++struct projectile_definition {struct {unsigned flags;real initial_velocity,air_gravity_scale,danger_radius,air_damage_range_upper_bound,maximum_range,collision_radius;struct tag_reference super_detonation,attached_detonation_damage,impact_damage;} projectile;};
++struct actor_burst_geometry {real burst_duration_lower_bound,burst_duration_upper_bound,burst_separation_lower_bound,burst_separation_upper_bound;};
++struct actor_ranged_combat_properties {struct tag_reference reference;real modified_vision_range,maximum_firing_range,target_lead_fraction,first_burst_delay_lower_bound,first_burst_delay_upper_bound;struct actor_burst_geometry burst_geometry;};
++struct actor_variant_definition {struct tag_reference actor_reference;struct actor_ranged_combat_properties ranged_combat;};
++struct actor_definition {short type;struct {real maximum_vision_distance,peripheral_distance,central_vision_angle,maximum_vision_angle,peripheral_vision_angle;} perception;};
++struct unit_definition {struct {unsigned flags;} unit;};
++struct object_marker {struct {real_point3d position;} matrix;};
++struct tag_iterator {int index;};
 +struct object_iterator {long index;};
++struct collision_result {short type;long object_index;real_point3d point;struct {real_vector3d n;} plane;};
 +#include "config.inc"
 +static struct companion_body companion_body;
 +static struct companion_enemy companion_enemies[12];
 +static short companion_enemy_count;
 +static long companion_unit_index,companion_lifecycle=1,companion_connection=2,now=30;
 +static struct unit_datum units[5];
-+static struct weapon_definition weapon_definition;
++static struct weapon_definition test_weapon_definition;
 +static struct weapon_trigger_definition fake_trigger;
-+static struct {long definition_index;} fake_weapon;
-+static char const *weapon_name="assault rifle";
-+static boolean blocked,unsafe,unreachable;
-+static int sight_tests;
++static struct weapon_datum fake_weapon;
++static struct projectile_definition fake_projectile;
++static struct actor_variant_definition fake_variant,override_variant;
++static struct actor_definition fake_actor;
++static struct unit_definition fake_unit_definition;
++static struct {real cutoff_radius;} fake_damage;
++static long held_weapon,tag_scans,aim_calls,estimate_calls,marker_object;
++static boolean blocked,unsafe,unreachable,missing_marker,nonlinear,aim_failure,head_only,blocked_muzzle,blocked_actual,spent;
++static int sight_tests,object_scans;
 +static long companion_context_serial;
 +static struct companion_command_context companion_contexts[32];
-+static real_point3d aimed_ground={2,3,0};
-+static void unit_get_aiming_vector(long i,real_vector3d *out){out->i=1;out->j=out->k=0;}
++static real_point3d aimed_ground={2,3,0},marker_origin;
++static real_vector3d actual_aim={1,0,0};
++static void unit_get_aiming_vector(long i,real_vector3d *out){*out=actual_aim;}
 +static void scale_vector3d(const real_vector3d *v,real scale,real_vector3d *out){out->i=v->i*scale;out->j=v->j*scale;out->k=v->k*scale;}
++static void point_from_line3d(const real_point3d *p,const real_vector3d *v,real t,real_point3d *o){o->x=p->x+v->i*t;o->y=p->y+v->j*t;o->z=p->z+v->k*t;}
 +static boolean collision_test_vector(long flags,const real_point3d *from,const real_vector3d *v,long i,struct collision_result *c){c->point=aimed_ground;c->type=2;c->plane.n.k=1;return TRUE;}
 +static char const *companion_order_names[]={"follow","stay","attack","rush","cover","fall back","pick up","get in","go_aim"};
 +#define TAG_BLOCK_GET_ELEMENT(a,b,c) (&fake_trigger)
-+#define weapon_definition_get(i) (&weapon_definition)
++#define weapon_definition_get(i) (&test_weapon_definition)
 +#define weapon_get(i) (&fake_weapon)
++#define projectile_definition_get(i) (&fake_projectile)
++#define damage_effect_definition_get(i) (&fake_damage)
++#define actor_variant_definition_get(i) ((i)==2?&override_variant:&fake_variant)
++#define actor_definition_get(i) (&fake_actor)
++#define unit_definition_get(i) (&fake_unit_definition)
++#define object_get unit_get
 +static struct unit_datum *unit_get(long i){return &units[i&0xffff];}
 +static struct unit_datum *unit_try_and_get(long i){return (i>=0 && (i&0xffff)<5)?unit_get(i):NULL;}
-+static long unit_inventory_get_weapon(long i,short w){return 0;}
-+static char const *tag_get_name(long i){return weapon_name;}
-+static char const *tag_name_strip_path(char const *name){return name;}
++static long unit_inventory_get_weapon(long i,short w){return held_weapon;}
 +static boolean game_team_is_enemy(short a,short b){return a!=b;}
 +static void unit_get_camera_position(long i,real_point3d *p){p->x=p->y=p->z=0;}
 +static void object_get_origin(long i,real_point3d *p){*p=unit_get(i)->object.bounding_sphere_center;}
++static void unit_get_center_of_mass(long i,real_point3d *p){*p=unit_get(i)->object.bounding_sphere_center;}
++static void unit_get_head_position(long i,real_point3d *p){unit_get_center_of_mass(i,p);p->z+=0.3f;}
 +static long game_time_get(void){return now;}
 +static void vector_from_points3d(const real_point3d *a,const real_point3d *b,real_vector3d *v){v->i=b->x-a->x;v->j=b->y-a->y;v->k=b->z-a->z;}
 +static real dot_product3d(const real_vector3d *a,const real_vector3d *b){return a->i*b->i+a->j*b->j+a->k*b->k;}
 +static real normalize3d(real_vector3d *v){real m=sqrtf(dot_product3d(v,v));if(m){v->i/=m;v->j/=m;v->k/=m;}return m;}
-+static boolean collision_test_line(long f,const real_point3d *a,const real_point3d *b,long ignore,struct collision_result *c){sight_tests++;c->type=2;c->object_index=NONE;return blocked;}
-+static void object_iterator_new(struct object_iterator *i,long mask,long flags){i->index=NONE;}
++static real distance3d(const real_point3d *a,const real_point3d *b){real_vector3d v;vector_from_points3d(a,b,&v);return sqrtf(dot_product3d(&v,&v));}
++static boolean collision_test_line(long f,const real_point3d *a,const real_point3d *b,long ignore,struct collision_result *c){sight_tests++;c->type=2;c->object_index=NONE;return blocked || (blocked_muzzle&&a->z>0.1f) || (blocked_actual&&b->y>0.05f) || (head_only&&b->z<0.2f);}
++static void object_iterator_new(struct object_iterator *i,long mask,long flags){i->index=NONE;object_scans++;}
 +static struct unit_datum *object_iterator_next(struct object_iterator *i){return ++i->index<5?&units[i->index]:NULL;}
++static void tag_iterator_new(struct tag_iterator *i,long group){i->index=0;tag_scans++;}
++static long tag_iterator_next(struct tag_iterator *i){return i->index++==0?0:NONE;}
++static int object_get_marker_by_name(long i,const char *s,struct object_marker *m,short n){marker_object=i;m->matrix.position=marker_origin;return !missing_marker;}
++#ifndef NATIVE_WEAPON_MATH
++static void unit_adjust_projectile_ray(long i,real_point3d *o,real_vector3d *v,real *velocity,boolean adjust,boolean aiming){*velocity=0;}
++#else
++static void object_get_velocities(long i,real_vector3d *v,void *unused){*v=unit_get(i)->object.translational_velocity;}
++#endif
++#ifndef NATIVE_WEAPON_MATH
++static real weapon_estimate_time_to_target(long i,short t,real d){estimate_calls++;return d/fake_projectile.projectile.initial_velocity;}
++static boolean weapon_aim(long i,short t,const real_point3d *o,const real_point3d *p,boolean lob,real_vector3d *aim,real *ticks,real *d,boolean *linear){aim_calls++;vector_from_points3d(o,p,aim);*d=normalize3d(aim);*linear=!nonlinear;return !aim_failure;}
++#else
++struct weapon_trigger {int unused;};
++#define weapon_trigger_get(w,t) ((struct weapon_trigger *)0)
++#define _projectile_aim_ballistic_bit 1
++#define projectile_aim_ballistic(...) FALSE
++#define match_assert_valid_real_normal3d(...) ((void)0)
++#endif
++static boolean weapon_can_be_fired(long i){return !spent;}
 +static boolean companion_ground(long i,const real_point3d *p,real a,real b,real_point3d *g){*g=*p;return !unsafe;}
 +static boolean companion_clearance(long i,const real_point3d *a,const real_point3d *b){return !unsafe;}
 +static boolean companion_reachable(long i,const real_point3d *p){return !unreachable;}
 +#include "under_test.inc"
++static void ready_shot(struct companion_shot *shot){
++ companion_body.target_time=now-12;companion_body.burst_time=now;
++ CHECK(companion_aim_solution(0,&companion_enemies[0],shot),"setup native aim solution");
++ companion_body.aim=actual_aim=shot->aim;
++}
 +int main(int argc,char **argv){
 + const char *case_name=argv[1];
 + struct companion_command_context context={71,1,2,30,TRUE,{5,0,0}};
-+ int i;
++ int i,matched=0;
++ struct companion_shot shot;
 + for(i=0;i<5;i++){units[i].object.owner_team_index=2;units[i].object.bounding_sphere_center.x=5;units[i].object.bounding_sphere_radius=0.1f;}
 + units[0].object.owner_team_index=1;units[1].object.owner_team_index=1;units[1].object.bounding_sphere_center.y=5;
++ units[0].object.bounding_sphere_center=(real_point3d){0,0,0};units[3].object.bounding_sphere_center.x=8;
++ for(i=0;i<5;i++){units[i].object.parent_object_index=NONE;units[i].object.forward.i=1;}
++ fake_weapon.definition_index=10;fake_weapon.object.parent_object_index=0;
++ fake_weapon.weapon.magazines[0].rounds_loaded=30;fake_weapon.weapon.magazines[0].rounds_total=90;
++ test_weapon_definition.weapon.triggers.count=1;test_weapon_definition.weapon.magazines.count=1;test_weapon_definition.weapon.ai_firing_parameters.index=NONE;
++ fake_trigger.projectile.index=20;fake_trigger.initial_rate_of_fire=10;fake_trigger.magazine_index=0;fake_trigger.minimum_rounds_loaded_per_shot=1;
++ fake_projectile.projectile.initial_velocity=10;fake_projectile.projectile.maximum_range=100;
++ fake_projectile.projectile.super_detonation.index=fake_projectile.projectile.attached_detonation_damage.index=fake_projectile.projectile.impact_damage.index=NONE;
++ fake_actor.type=_actor_marine;fake_actor.perception.maximum_vision_distance=40;fake_actor.perception.peripheral_distance=10;
++ fake_actor.perception.central_vision_angle=1.0f;fake_actor.perception.maximum_vision_angle=1.4f;fake_actor.perception.peripheral_vision_angle=2.0f;
++ fake_variant.actor_reference.index=0;fake_variant.ranged_combat.reference.index=10;fake_variant.ranged_combat.maximum_firing_range=13;
++ fake_variant.ranged_combat.target_lead_fraction=1;
++ fake_variant.ranged_combat.burst_geometry=(struct actor_burst_geometry){0.6f,0.6f,0.3f,0.3f};
++ fake_variant.ranged_combat.first_burst_delay_lower_bound=fake_variant.ranged_combat.first_burst_delay_upper_bound=0.4f;
++ companion_update_combat_profile(0);
 + companion_body.target_unit_index=NONE;companion_body.aim.i=1;
 + companion_enemy_count=2;companion_enemies[0]=(struct companion_enemy){2,5,TRUE,{5,0,0}};companion_enemies[1]=(struct companion_enemy){3,8,TRUE,{8,0,0}};
++ CASE("native-profile-override"){
++  override_variant=fake_variant;override_variant.ranged_combat.maximum_firing_range=22;
++  override_variant.ranged_combat.first_burst_delay_lower_bound=override_variant.ranged_combat.first_burst_delay_upper_bound=0.2f;
++  test_weapon_definition.weapon.ai_firing_parameters.index=2;held_weapon=1;
++  companion_update_combat_profile(0);
++  CHECK(companion_engagement_range(0)==22&&companion_body.combat.reaction_ticks==6,"weapon native AI override wins");
++  CHECK(companion_body.burst_time==now+6,"reaction precedes a full burst");
++  fake_projectile.projectile.maximum_range=15;held_weapon=2;companion_update_combat_profile(0);
++  CHECK(companion_engagement_range(0)==15,"projectile maximum caps soldier range");
++ }
++ CASE("minimum-range"){
++  test_weapon_definition.weapon.ai_minimum_target_range=6;held_weapon=1;companion_update_combat_profile(0);
++  CHECK(!companion_target_eligible(&companion_enemies[0],companion_engagement_range(0)),"too-close targets cannot fire");
++  CHECK(companion_target_eligible(&companion_enemies[1],companion_engagement_range(0)),"valid native range remains available");
++ }
++ CASE("unsupported"){
++  int kind;
++  for(kind=0;kind<9;kind++){
++   fake_projectile.projectile.air_gravity_scale=kind==0?1:0;
++   fake_projectile.projectile.danger_radius=kind==1?1:0;
++   fake_projectile.projectile.super_detonation.index=kind==2?30:NONE;
++   fake_projectile.projectile.attached_detonation_damage.index=kind==3?30:NONE;
++   fake_projectile.projectile.flags=kind==4?FLAG(3):0;
++   fake_projectile.projectile.impact_damage.index=kind==5?30:NONE;fake_damage.cutoff_radius=1;
++   fake_trigger.charging_time=kind==6?1:0;
++   fake_trigger.flags=kind==7?FLAG(_weapon_trigger_uses_weapon_origin_bit):kind==8?FLAG(_weapon_trigger_projectiles_cannot_be_aimed_bit):0;
++   held_weapon++;companion_update_combat_profile(0);
++   CHECK(companion_engagement_range(0)==0&&!companion_aim_solution(0,&companion_enemies[0],&shot),"unsupported metadata case %d must not fire",kind);
++  }
++ }
++ CASE("stationary-solution"){
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot),"native weapon solution exists");
++  CHECK(shot.target.x==5&&shot.target.y==0&&shot.aim.i>0.999f,"stationary target stays centered");
++  CHECK(companion_body.combat_metrics.aims==1,"one aim solve per target frame");
++ }
++ CASE("moving-projectile"){
++  units[2].object.translational_velocity.j=0.02f;fake_projectile.projectile.initial_velocity=0.2f;
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot),"slow projectile solution");
++  CHECK(fabsf(shot.target.y-0.5f)<0.0001f&&shot.aim.j>0.09f,"lead uses 25 ticks times per-tick velocity, not seconds");
++  fake_projectile.projectile.initial_velocity=1000;
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot)&&shot.target.y<0.0002f,"hitscan-like projectile needs negligible lead");
++ }
++ CASE("vehicle-lead"){
++  units[2].object.parent_object_index=4;units[4].object.translational_velocity.j=0.02f;fake_projectile.projectile.initial_velocity=0.2f;
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot)&&fabsf(shot.target.y-0.5f)<0.0001f,"rider inherits parent movement for lead");
++ }
++ CASE("aim-failure"){
++  missing_marker=TRUE;CHECK(!companion_aim_solution(0,&companion_enemies[0],&shot),"missing muzzle fails closed");
++  missing_marker=FALSE;nonlinear=TRUE;CHECK(!companion_aim_solution(0,&companion_enemies[0],&shot),"nonlinear solver output fails closed");
++  nonlinear=FALSE;aim_failure=TRUE;CHECK(!companion_aim_solution(0,&companion_enemies[0],&shot),"failed native aim never authorizes fire");
++ }
++ CASE("head-visibility"){
++  head_only=TRUE;CHECK(companion_refresh_enemy(0,&companion_enemies[0]),"visible head above blocked center");
++  CHECK(companion_enemies[0].aim_point.z>0.2f,"aim uses collision-confirmed exposed head");
++  blocked=TRUE;CHECK(!companion_refresh_enemy(0,&companion_enemies[0]),"both occluded points are invisible");
++ }
++ CASE("marine-vision"){
++  companion_enemies[0].distance=30;companion_enemies[0].aim_point=(real_point3d){30,0,0};
++  CHECK(companion_enemy_in_view(0,&companion_enemies[0]),"central Marine sight extends beyond engagement range");
++  companion_enemies[0].distance=41;CHECK(!companion_enemy_in_view(0,&companion_enemies[0]),"native maximum vision cap");
++  companion_enemies[0].distance=5;companion_enemies[0].aim_point=(real_point3d){0,5,0};
++  CHECK(companion_enemy_in_view(0,&companion_enemies[0]),"near peripheral sight");
++  companion_enemies[0].distance=20;CHECK(!companion_enemy_in_view(0,&companion_enemies[0]),"far peripheral target is not central sight");
++  companion_enemies[0].distance=5;companion_enemies[0].aim_point=(real_point3d){-5,0,0};
++  CHECK(!companion_enemy_in_view(0,&companion_enemies[0]),"new unseen enemy behind Kevin not magically visible");
++  companion_body.target_unit_index=2;CHECK(companion_enemy_in_view(0,&companion_enemies[0]),"known target remains trackable while turning");
++ }
++ CASE("recent-attacker"){
++  companion_body.target_unit_index=2;companion_body.target_time=0;
++  units[1].unit.attackers[0]=(struct unit_attacker){now,1,3,NONE};
++  companion_update_target(0);CHECK(companion_body.target_unit_index==3,"visible enemy hurting Chief takes priority");
++  units[0].unit.attackers[0]=(struct unit_attacker){now,1,2,NONE};now+=1;
++  companion_update_target(0);CHECK(companion_body.target_unit_index==3,"switch hysteresis prevents jitter");
++  now+=15;companion_update_target(0);CHECK(companion_body.target_unit_index==2,"direct recent attacker can supersede lower-priority threat");
++ }
++ CASE("dead-occluded"){
++  companion_body.target_unit_index=2;companion_enemy_count=1;companion_enemies[0].visible=FALSE;units[2].object.damage_flags=1;
++  companion_update_target(0);CHECK(companion_body.target_unit_index==NONE,"visibility grace cannot retain dead target");
++ }
++ CASE("muzzle-safety"){
++  marker_origin.z=0.25f;CHECK(companion_aim_solution(0,&companion_enemies[0],&shot),"muzzle solution");
++  actual_aim=shot.aim;blocked_muzzle=TRUE;
++  CHECK(!companion_safe_shot(0,&companion_enemies[0],&shot),"clear camera does not authorize blocked muzzle");
++ }
++ CASE("actual-ray-safety"){
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot),"intended aim clear");
++  actual_aim=(real_vector3d){0.9998f,0.02f,0};normalize3d(&actual_aim);blocked_actual=TRUE;
++  CHECK(!companion_safe_shot(0,&companion_enemies[0],&shot),"geometry along current aim must also be clear");
++ }
++ CASE("friendly-entry"){
++  ready_shot(&shot);CHECK(companion_fire_requested(0,&companion_enemies[0],&shot),"clear firing opportunity");
++  units[1].object.bounding_sphere_center=(real_point3d){2,0,0};now++;
++  CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"Chief crossing ray cancels next fire control immediately");
++  CHECK(companion_body.combat_metrics.blocked==1,"blocked shot counted");
++ }
++ CASE("friendly-intended-and-actual"){
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot),"safe desired line");
++  actual_aim=(real_vector3d){0.8660254f,0.5f,0};units[1].object.bounding_sphere_center=(real_point3d){2,1.1547f,0};
++  CHECK(!companion_safe_shot(0,&companion_enemies[0],&shot),"ally in current cone cancels even when intended ray is clear");
++ }
++ CASE("reload-and-heat"){
++  ready_shot(&shot);fake_weapon.weapon.magazines[0].rounds_loaded=0;
++  CHECK(companion_reload_needed(0)&&!companion_fire_requested(0,&companion_enemies[0],&shot),"empty magazine reloads, never fires");
++  fake_weapon.weapon.state=5;CHECK(!companion_reload_needed(0),"no repeated reload request while already reloading");
++  fake_weapon.weapon.state=0;fake_weapon.weapon.magazines[0].rounds_loaded=30;fake_weapon.weapon.flags=1;
++  CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"native overheat suppresses firing");
++  fake_weapon.weapon.flags=0;CHECK(companion_fire_requested(0,&companion_enemies[0],&shot),"native recovery permits firing again");
++  fake_weapon.weapon.magazines[0].rounds_loaded=0;fake_weapon.weapon.magazines[0].rounds_total=0;
++  CHECK(!companion_reload_needed(0),"no endless reload without reserve ammo");
++ }
++ CASE("weapon-change"){
++  companion_body.target_unit_index=2;now=200;held_weapon=1;fake_trigger.flags=FLAG(_weapon_trigger_latched_bit);
++  companion_update_combat_profile(0);
++  CHECK(companion_body.combat.latched&&companion_body.target_time==200&&companion_body.burst_time==212,"new weapon resets cadence and reaction");
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot),"new weapon aim");
++  CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"weapon switch cannot inherit a previous firing window");
++ }
++ CASE("semi-bursts"){
++  companion_body.combat.burst_ticks=18;companion_body.combat.pause_ticks=9;
++  CHECK(companion_trigger_on(0,TRUE,5)&&!companion_trigger_on(1,TRUE,5),"semiautomatic press then release");
++  CHECK(!companion_trigger_on(18,TRUE,5)&&!companion_trigger_on(24,TRUE,5),"semiautomatic also honors native burst pause");
++  CHECK(companion_trigger_on(27,TRUE,5),"new burst restarts trigger cadence");
++ }
++ CASE("fire-and-orders"){
++  int order;for(order=0;order<3;order++){
++   companion_body.order=order==0?_companion_order_follow:order==1?_companion_order_hold:_companion_order_move;
++   ready_shot(&shot);CHECK(companion_fire_requested(0,&companion_enemies[0],&shot),"movement order permits defending");
++   companion_body.hold_fire=TRUE;CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"hold fire cancels immediately");
++   CHECK(companion_body.order==(order==0?_companion_order_follow:order==1?_companion_order_hold:_companion_order_move),"fire control never changes movement");
++   companion_body.hold_fire=FALSE;
++  }
++ }
++ CASE("sensing-budget"){
++  for(now=60;now<150;now++){companion_look_around(0,1);companion_update_target(0);}
++  CHECK(companion_body.combat_metrics.scans==15,"90 ticks use exactly 15 global enemy scans");
++  CHECK(object_scans==15,"candidate ranking must not perform global friendly scans");
++  CHECK(tag_scans==1,"no per-tick profile/tag scans");
++ }
++ if(!strcmp(case_name,"combat-measure")||!strcmp(case_name,"combat-measure-blocked")){
++  matched++;
++  int fired=0;for(now=60;now<150;now++){
++   struct companion_enemy *enemy;
++   if(!strcmp(case_name,"combat-measure-blocked"))units[1].object.bounding_sphere_center=(real_point3d){2,now>=80&&now<86?0:5,0};
++   companion_look_around(0,1);companion_update_target(0);enemy=companion_current_target();
++   if(enemy)companion_refresh_enemy(0,enemy);
++   if(companion_aim_solution(0,enemy,&shot)){
++    companion_body.aim=actual_aim=shot.aim;
++    if(companion_fire_requested(0,enemy,&shot))fired++;
++   }
++  }
++  CHECK(fired>35&&fired<70,"useful firing opportunities with reaction/burst pauses: %d",fired);
++  CHECK(companion_body.combat_metrics.scans==15&&tag_scans==1,"bounded sensing while fighting");
++  CHECK(companion_body.combat_metrics.friends==fired+companion_body.combat_metrics.blocked,"one fresh friendly scan per permitted firing opportunity");
++  if(!strcmp(case_name,"combat-measure-blocked"))CHECK(fired==48&&companion_body.combat_metrics.blocked==6,"six unsafe fire requests suppressed immediately");
++  printf("90 ticks: decisions=%ld scans=%ld visibility=%ld aims=%ld rays=%ld friends=%ld fire_requests=%ld blocked=%ld profiles=%ld\n",
++   companion_body.combat_metrics.decisions,companion_body.combat_metrics.scans,companion_body.combat_metrics.visibility,
++   companion_body.combat_metrics.aims,companion_body.combat_metrics.rays,companion_body.combat_metrics.friends,
++   companion_body.combat_metrics.requests,companion_body.combat_metrics.blocked,companion_body.combat_metrics.profiles);
++ }
++ CASE("blocked-retarget"){
++  companion_body.target_unit_index=2;companion_body.target_time=0;
++  companion_blocked_target(2);now+=10;companion_update_target(0);
++  CHECK(companion_body.target_unit_index==2,"brief ally crossing retains target");
++  now+=13;companion_blocked_target(2);companion_update_target(0);
++  CHECK(companion_body.target_unit_index==3,"persistent unusable shot yields another visible threat");
++  CHECK(companion_body.order==_companion_order_follow,"blocked fire does not create movement");
++ }
++ CASE("marine-transition-vision"){
++  companion_enemies[0].distance=20;companion_enemies[0].aim_point=(real_point3d){7.247f,18.641f,0};
++  CHECK(companion_enemy_in_view(0,&companion_enemies[0]),"native angle transition still sees nearby target");
++  companion_enemies[0].distance=30;
++  CHECK(!companion_enemy_in_view(0,&companion_enemies[0]),"transition decreases range toward peripheral vision");
++ }
++ CASE("origin-camera"){
++  real_point3d firing;real_vector3d aim={1,0,0};
++  fake_unit_definition.unit.flags=FLAG(_unit_fires_from_camera_bit);marker_origin=(real_point3d){0.2f,0.1f,0.3f};
++  fake_weapon.object.flags=FLAG(_object_invisible_bit);held_weapon=7;companion_update_combat_profile(0);
++  CHECK(companion_firing_origin(0,7,&aim,&firing)&&fabsf(firing.x-0.2f)<0.00001f&&firing.y==0&&firing.z==0,"native camera projection agrees with projectile spawn origin");
++  CHECK(marker_object==0,"hidden weapon uses parent's trigger marker, as native spawning does");
++ }
 + CASE("combat-state"){
 +  real metres[]={20,49,60,5,100};boolean visible[]={TRUE,TRUE,TRUE,FALSE,FALSE};boolean expected[]={TRUE,TRUE,FALSE,FALSE,FALSE};
 +  companion_enemy_count=1;
@@ -6998,13 +8191,14 @@ index 0000000000000000000000000000000000000000..524d1a45b45b09c1a1e44fba5f23a76b
 +  CHECK(!companion_in_combat(1),"dead enemies ignored");units[2].object.damage_flags=0;units[2].object.owner_team_index=1;
 +  CHECK(!companion_in_combat(1),"changed team ignored");units[2].object.owner_team_index=2;units[0].object.damage_flags=1;CHECK(!companion_in_combat(1),"dead Kevin has no visible combat");units[0].object.damage_flags=0;companion_enemy_count=0;CHECK(!companion_in_combat(1),"no enemies");
 + }
-+ CASE("profiles"){CHECK(companion_weapon_range("assault rifle")==12,"rifle range");CHECK(companion_weapon_range("rocket launcher")==0,"no explosives");CHECK(companion_weapon_range("unknown")==4,"conservative unknown");}
++ CASE("profiles"){CHECK(companion_engagement_range(0)==13,"native Marine rifle range");CHECK(companion_body.combat.vision==40,"native Marine vision");CHECK(tag_scans==1,"profile cached");}
++
 + CASE("acquire"){companion_update_target(0);CHECK(companion_body.target_unit_index==2,"automatic nearest");CHECK(companion_body.target_time==now,"reaction clock");CHECK(companion_body.order==_companion_order_follow,"combat preserves follow");}
 + CASE("occluded-elite"){companion_enemies[0].visible=FALSE;companion_body.target_unit_index=2;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"visible beats nearer occluded target");companion_enemies[0].distance=33.5f;companion_body.target_unit_index=2;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"visible nearby beats invisible 102m elite");}
 + CASE("retain"){companion_body.target_unit_index=3;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"stable valid target");}
 + CASE("switch"){companion_body.target_unit_index=2;units[2].object.damage_flags=1;companion_update_target(0);CHECK(companion_body.target_unit_index==3,"dead target cleared");units[3].object.damage_flags=1;companion_update_target(0);CHECK(companion_body.target_unit_index==NONE,"no valid target");}
-+ CASE("visibility-grace"){companion_enemy_count=1;companion_body.target_unit_index=2;companion_enemies[0].visible=FALSE;companion_update_target(0);CHECK(companion_body.target_unit_index==2,"brief tracking grace");CHECK(!companion_safe_shot(0,&companion_enemies[0],TRUE),"no firing while occluded");now+=23;companion_update_target(0);CHECK(companion_body.target_unit_index==NONE,"grace expires");}
-+ CASE("friendly-fire"){CHECK(companion_safe_shot(0,&companion_enemies[0],FALSE),"clear shot");units[1].object.bounding_sphere_center=(real_point3d){2,0,0};CHECK(!companion_safe_shot(0,&companion_enemies[0],FALSE),"Chief blocks shot");units[1].object.bounding_sphere_center=(real_point3d){2,0.3f,0};fake_trigger.projectile_error_angle_upper_bound=0.2f;weapon_definition.weapon.triggers.count=1;CHECK(!companion_safe_shot(0,&companion_enemies[0],TRUE),"spread margin");units[1].object.bounding_sphere_center.y=5;blocked=TRUE;CHECK(!companion_safe_shot(0,&companion_enemies[0],FALSE),"wall blocks shot");}
++ CASE("visibility-grace"){companion_enemy_count=1;companion_body.target_unit_index=2;companion_enemies[0].visible=FALSE;companion_update_target(0);CHECK(companion_body.target_unit_index==2,"brief tracking grace");CHECK(!(companion_aim_solution(0,&companion_enemies[0],&shot)&&companion_safe_shot(0,&companion_enemies[0],&shot)),"no firing while occluded");now+=23;companion_update_target(0);CHECK(companion_body.target_unit_index==NONE,"grace expires");}
++ CASE("friendly-fire"){CHECK((companion_aim_solution(0,&companion_enemies[0],&shot)&&companion_safe_shot(0,&companion_enemies[0],&shot)),"clear shot");units[1].object.bounding_sphere_center=(real_point3d){2,0,0};CHECK(!(companion_aim_solution(0,&companion_enemies[0],&shot)&&companion_safe_shot(0,&companion_enemies[0],&shot)),"Chief blocks shot");units[1].object.bounding_sphere_center=(real_point3d){2,0.3f,0};fake_trigger.projectile_error_angle_upper_bound=0.2f;companion_body.combat.initialized=FALSE;companion_update_combat_profile(0);CHECK(!(companion_aim_solution(0,&companion_enemies[0],&shot)&&companion_safe_shot(0,&companion_enemies[0],&shot)),"spread margin");units[1].object.bounding_sphere_center.y=5;blocked=TRUE;CHECK(!(companion_aim_solution(0,&companion_enemies[0],&shot)&&companion_safe_shot(0,&companion_enemies[0],&shot)),"wall blocks shot");}
 + CASE("trigger"){CHECK(companion_trigger_on(0,FALSE,10),"burst starts");CHECK(!companion_trigger_on(18,FALSE,10),"burst gap");CHECK(companion_trigger_on(0,TRUE,5),"latched press");CHECK(!companion_trigger_on(1,TRUE,5),"latched release");CHECK(companion_trigger_on(6,TRUE,5),"latched repeats");}
 + CASE("captured-aim"){struct companion_command_context *captured=companion_capture_context();CHECK(captured->valid,"capture ground");aimed_ground.x=50;CHECK(!companion_apply_command("go_aim",captured),"captured command valid");CHECK(companion_body.hold_point.x==2&&companion_body.hold_point.y==3,"changing aim cannot move captured destination");}
 + CASE("orders"){for(i=0;i<3;i++){companion_body.order=i==0?_companion_order_follow:i==1?_companion_order_hold:_companion_order_move;CHECK(!companion_apply_command("hold_fire",&context),"hold fire accepted");CHECK(companion_body.order==(i==0?_companion_order_follow:i==1?_companion_order_hold:_companion_order_move),"fire preserves movement");CHECK(companion_body.hold_fire,"fire disabled");CHECK(!companion_apply_command("resume_fire",&context),"resume accepted");CHECK(!companion_body.hold_fire,"fire enabled");}companion_body.hold_fire=TRUE;CHECK(!companion_apply_command("stay",&context),"stay accepted");CHECK(companion_body.hold_fire,"stay preserves fire");CHECK(!companion_apply_command("go_aim",&context)&&companion_body.order==_companion_order_move,"go aim accepted");CHECK(companion_body.hold_point.x==5,"captured destination");CHECK(!companion_apply_command("follow",&context)&&companion_body.hold_fire,"follow preserves fire");CHECK(companion_apply_command("shoot_chief",&context)!=NULL,"legacy refused");}
@@ -7012,7 +8206,126 @@ index 0000000000000000000000000000000000000000..524d1a45b45b09c1a1e44fba5f23a76b
 + CASE("context"){CHECK(companion_context_current(&context,71),"valid context");companion_lifecycle++;CHECK(!companion_context_current(&context,71),"load invalidates");companion_lifecycle--;companion_connection++;CHECK(!companion_context_current(&context,71),"reconnect invalidates");companion_connection--;now+=901;CHECK(!companion_context_current(&context,71),"expires");CHECK(!companion_context_current(&context,72),"id mismatch");}
 + CASE("parser"){char out[32];CHECK(companion_message_value("{\"action\": \"stay\"}","action",out,32)&&!strcmp(out,"stay"),"flat command");CHECK(!companion_message_value("{\"action\":\"stay\",\"action\":\"shoot\"}","action",out,32),"duplicate refused");CHECK(!companion_message_value("{\"action\":\"st\\u0061y\"}","action",out,32),"escapes refused");CHECK(companion_message_number("{\"id\":71}","id")==71,"id");CHECK(!companion_message_number("{\"id\":-1}","id"),"negative");CHECK(!companion_message_number("{\"id\":999999999999999999999}","id"),"overflow");}
 + CASE("reset"){companion_body.order=_companion_order_hold;companion_body.hold_fire=TRUE;companion_body.jumping=TRUE;companion_reset_body(0);CHECK(companion_body.order==_companion_order_follow&&!companion_body.hold_fire,"spawn/load defaults");CHECK(!companion_body.jumping&&companion_body.target_unit_index==NONE,"transient reset");CHECK(companion_lifecycle==2,"contexts invalidated");}
-+ CHECK(sight_tests>=0,"collision fixture");
++ CHECK(matched==1,"exactly one case must run: %s",case_name);
++ CHECK(sight_tests>=0&&object_scans>=0&&aim_calls>=0&&estimate_calls>=0&&nonlinear>=0&&aim_failure>=0,"collision fixture");
++ return 0;
++}
+diff --git a/tools/harness/tests/companion_obstacles.c b/tools/harness/tests/companion_obstacles.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e1c12aac7a1ece37c8cc618f6e9309a212078c8
+--- /dev/null
++++ b/tools/harness/tests/companion_obstacles.c
+@@ -0,0 +1,112 @@
++#include "harness.h"
++#include <math.h>
++typedef struct { real x,y; } real_point2d;
++typedef struct { real i,j; } real_vector2d;
++#define MAX(a,b) ((a)>(b)?(a):(b))
++#define MIN(a,b) ((a)<(b)?(a):(b))
++#define REAL_MAX 1e30f
++#define csmemset memset
++#define match_vassert(file,line,condition,...) CHECK(condition,"native assertion")
++#define match_assert_valid_real(...) ((void)0)
++#define match_assert_valid_real_point2d(...) ((void)0)
++#define error(...) ((void)0)
++#define _error_silent 0
++#define _error_log 0
++#define BIT_VECTOR_SIZE_IN_LONGS(n) (((n)+31)/32)
++#define BIT_VECTOR_SIZE_IN_BYTES(n) (4*BIT_VECTOR_SIZE_IN_LONGS(n))
++#define BIT_VECTOR_TEST_FLAG(a,n) (((a)[(n)/32] & (1UL<<((n)%32))) != 0)
++#define BIT_VECTOR_SET_FLAG(a,n,value) ((a)[(n)/32] |= (1UL<<((n)%32)))
++#define COMPANION_PATH_TICKS 15
++#define COMPANION_OBSTACLE_REACH 16.f
++#define _z 2
++#include "config.inc"
++struct structure_bsp {int unused;};
++struct collision_bsp {int unused;};
++struct path_debug_storage {
++ boolean use_stored_obstacles;short avoidance_path_count;
++ struct obstacles avoidance_obstacles[4];struct obstacle_path avoidance_paths[4];
++};
++struct path_state {struct path_input input;struct path_debug_storage *debug;};
++static struct structure_bsp world;
++static struct collision_bsp collision;
++static struct companion_body companion_body;
++static struct path_state companion_path_state;
++struct obstacle_path debug_path;
++struct obstacles debug_obstacles;
++boolean debug_obstacle_path_on_failure,debug_obstacle_path,debug_obstacle_path_finishing,debug_ignore_broken_surfaces;
++real_point3d debug_obstacle_path_start_point,debug_obstacle_path_goal_point;
++long debug_obstacle_path_start_surface_index,debug_obstacle_path_goal_surface_index;
++real debug_obstacle_path_radius;
++static real_point3d origin;
++static long now=30,collections;
++static real path_obstacle_search_reach,half_width=1000.f;
++static boolean blocker=TRUE;
++static real_point3d blocker_point={1,0,0};
++static long game_time_get(void){return now;}
++#define global_structure_bsp_get() (&world)
++#define global_collision_bsp_get() (&collision)
++#define companion_navigation_radius(i) 0.22f
++static long companion_navigation_start(long i,real_point3d *p){*p=origin;return 1;}
++static void companion_safety_invalidate(void){companion_body.safety[0].valid=companion_body.safety[1].valid=FALSE;}
++static void path_input_new(struct path_input *p,real r,boolean broken,long source){memset(p,0,sizeof(*p));p->pathfinding_radius=r;p->ignore_source_object_index=source;p->ignore_target_object_index=NONE;}
++static void path_input_set_start(struct path_input *p,const real_point3d *a,long surface){p->start_point=*a;p->start_surface_index=surface;p->start_valid=TRUE;}
++static real_vector2d *vector_from_points2d(const real_point2d *a,const real_point2d *b,real_vector2d *v){v->i=b->x-a->x;v->j=b->y-a->y;return v;}
++static void vector_from_points3d(const real_point3d *a,const real_point3d *b,real_vector3d *v){v->i=b->x-a->x;v->j=b->y-a->y;v->k=b->z-a->z;}
++static real normalize3d(real_vector3d *v){real d=sqrtf(v->i*v->i+v->j*v->j+v->k*v->k);if(d){v->i/=d;v->j/=d;v->k/=d;}return d;}
++static real dot_product2d(const real_vector2d *a,const real_vector2d *b){return a->i*b->i+a->j*b->j;}
++static real magnitude_squared2d(const real_vector2d *v){return dot_product2d(v,v);}
++static real normalize2d(real_vector2d *v){real d=sqrtf(magnitude_squared2d(v));if(d){v->i/=d;v->j/=d;}return d;}
++static real_point2d *point_from_line2d(const real_point2d *p,const real_vector2d *v,real t,real_point2d *o){o->x=p->x+v->i*t;o->y=p->y+v->j*t;return o;}
++static real square_root(real f){return sqrtf(f);}
++static real cross_product2d(const real_vector2d *a,const real_vector2d *b){return a->i*b->j-a->j*b->i;}
++static void rotate_vector2d(const real_vector2d *v,real s,real c,real_vector2d *out){out->i=v->i*c-v->j*s;out->j=v->i*s+v->j*c;}
++static void perpendicular2d(const real_vector2d *v,real_vector2d *out){out->i=-v->j;out->j=v->i;}
++static real distance3d(const real_point3d *a,const real_point3d *b){real_vector3d v;vector_from_points3d(a,b,&v);return sqrtf(v.i*v.i+v.j*v.j+v.k*v.k);}
++static boolean point_in_circle(const real_point2d *p,const real_point2d *q,real r){return (p->x-q->x)*(p->x-q->x)+(p->y-q->y)*(p->y-q->y)<r*r;}
++#define project_point3d(p,axis,positive,out) (*(out)=(real_point2d){(p)->x,(p)->y})
++#define collision_surface_project_point2d(bsp,surface,axis,positive,p,out) (*(out)=(real_point3d){(p)->x,(p)->y,0})
++#define obstacles_get_disc(o,i) (&(o)->discs[i])
++#define structure_surfaces_are_equivalent(s,p,a,b) ((a)==(b))
++static boolean structure_test_ray2d(struct structure_bsp const *b,boolean ignore,const real_point2d *p,long surface,const real_vector2d *v,real distance,struct structure_test_ray2d_result *r){
++ real t=distance;
++ if(v->j>0)t=MIN(t,(half_width-p->y)/v->j);
++ if(v->j<0)t=MIN(t,(-half_width-p->y)/v->j);
++ r->distance=MAX(0,t);r->surface_index=1;r->edge_index=t<distance?0:NONE;
++ return t<distance;
++}
++static boolean obstacles_add_disc(struct obstacles *,long,short,const real_point3d *,real);
++static void obstacles_get_discs_in_sphere(struct obstacles *o,const real_point3d *p,real reach,const real_vector3d *v,long source,long target){
++ CHECK(source==7&&target==NONE,"native collector gets correct unit and target context");collections++;
++ if(blocker)obstacles_add_disc(o,8,0,&blocker_point,0.25f);
++}
++#include "under_test.inc"
++int main(int argc,char **argv){
++ const char *case_name=argv[1];
++ companion_body.path_valid=TRUE;companion_body.path.valid=TRUE;
++ companion_body.path.steps_finish_path=TRUE;companion_body.path.step_count=1;
++ companion_body.path.steps[0]=(struct path_step){1,{3,0,0}};
++ CASE("detour"){
++  CHECK(companion_refresh_obstacles(7),"real native solver finds tangent detour");
++  CHECK(companion_body.path.step_count>1&&fabsf(companion_body.path.steps[0].point.y)>0.25f,"solver adds a real lateral tangent waypoint");
++  CHECK(collections==1&&path_obstacle_search_reach==0,"one bounded collection and engine override restored");
++ }
++ CASE("blocker-moves"){
++  CHECK(companion_refresh_obstacles(7),"initial detour");now+=15;blocker_point.y=2;
++  companion_body.path.step_count=1;companion_body.path.steps[0]=(struct path_step){1,{3,0,0}};
++  CHECK(companion_refresh_obstacles(7)&&companion_body.path.step_count==1,"moving object no longer blocks straight route");
++ }
++ CASE("blocked-corridor"){
++  struct path_result old=companion_body.path;half_width=0.3f;
++  CHECK(!companion_refresh_obstacles(7),"no tangent fits between blocker and corridor walls");
++  CHECK(memcmp(&old,&companion_body.path,sizeof(old))==0,"failed real solver leaves route intact");
++ }
++ CASE("fresh-start"){
++  origin=(real_point3d){0.4f,0,0};CHECK(companion_refresh_obstacles(7),"solver starts at current grounded position");
++  CHECK(companion_path_state.input.start_point.x==0.4f&&companion_path_state.input.start_surface_index==1,"fresh start supplied");
++ }
++ CASE("partial-route"){
++  companion_body.path.steps_finish_path=FALSE;CHECK(companion_refresh_obstacles(7),"refit unfinished route");
++  CHECK(!companion_body.path.steps_finish_path&&companion_body.path.step_count<=4,"partial status and engine step limit preserved");
++ }
 + return 0;
 +}
 diff --git a/tools/harness/tests/mixer.c b/tools/harness/tests/mixer.c
@@ -7031,10 +8344,10 @@ index c337600cfe575528cbb6141daa9098e8cdcd9152..993cc4fc59937b4bd6654d05f158cae9
  #define PI 3.14159265358979323846
 diff --git a/tools/harness/tests/test_companion.py b/tools/harness/tests/test_companion.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..973e0a21f87954334eecf4018b8d673622e74838
+index 0000000000000000000000000000000000000000..1e9b6098c971d25cc8d31d4192b96732997a0d1b
 --- /dev/null
 +++ b/tools/harness/tests/test_companion.py
-@@ -0,0 +1,72 @@
+@@ -0,0 +1,101 @@
 +"""Real native companion movement against deterministic path/collision results."""
 +import sys
 +from pathlib import Path
@@ -7042,22 +8355,35 @@ index 0000000000000000000000000000000000000000..973e0a21f87954334eecf4018b8d6736
 +sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 +from harness import build, read, function, structure, enum_with, mutated, run, CHECK_FAILED
 +
-+FUNCTIONS = ['companion_navigation_radius', 'companion_flat_distance', 'companion_ground_probe', 'companion_ground', 'companion_clearance',
++FUNCTIONS = ['companion_navigation_radius', 'companion_flat_distance', 'companion_ground_sample', 'companion_ground_probe', 'companion_footprint_wall', 'companion_ground_support', 'companion_ground', 'companion_walkable_surface', 'companion_navigation_start', 'companion_surface_from', 'companion_goal_surface', 'companion_clearance',
 +             'companion_step_clearance', 'companion_safety_invalidate', 'companion_navigation_metrics', 'companion_corridor_contains',
-+             'companion_validate_corridor', 'companion_safe_direction_check', 'companion_safe_direction', 'companion_try_jump', 'companion_progress_stalled',
++             'companion_surface_transition', 'companion_validate_corridor', 'companion_safe_direction_check', 'companion_safe_direction', 'companion_advance_waypoint', 'companion_refresh_obstacles', 'companion_movement_throttle', 'companion_try_jump', 'companion_progress_stalled',
 +             'companion_retry_ticks', 'companion_follow_goal', 'companion_goal',
 +             'companion_find_path', 'companion_walk_direction', 'companion_catch_up']
-+CASES = ['follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
++CASES = ['waypoint-bounds', 'waypoint-ramp', 'waypoint-invalid-surface', 'waypoint-gate-budget', 'dynamic-blocker', 'local-refit-budget', 'local-refit-atomic', 'local-refit-partial', 'local-refit-cliff', 'dynamic-blocker-clears', 'narrow-corridor', 'aiming-movement', 'throttle-old-physics', 'padding-prefix', 'waypoint-overshoot', 'waypoint-corner-blocked', 'wall-footprint-live', 'wall-footprint-gap', 'wall-parallel', 'wall-footprint-cliff', 'wall-footprint-obstruction', 'wall-footprint-jump', 'follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
 +         'cliff', 'slope', 'clearance', 'jump', 'jump-outcome', 'unsafe-jump', 'teleport', 'safety-performance', 'cache-expiry', 'cache-boundary', 'cache-turn',
-+         'cache-invalidation', 'cache-speed', 'cache-obstruction', 'cliff-speeds', 'cache-slope', 'cache-jump', 'cache-actual-position', 'floor-contact']
++         'cache-invalidation', 'cache-speed', 'cache-obstruction', 'cliff-speeds', 'cache-slope', 'cache-jump', 'cache-actual-position', 'floor-contact', 'doorway-transition', 'doorway-reject', 'doorway-follow', 'missing-support-cache', 'missing-nav-cache', 'missing-cache-cliff', 'terrain-recovery-wake', 'terrain-recovery-cliff']
 +
 +
 +def generated(fault=None):
 +    source = read('port/linux/game/companion.c')
 +    config = enum_with(source, '_companion_order_follow') + enum_with(source, '_companion_nav_idle')
 +    config += structure(source, 'companion_corridor') + structure(source, 'companion_nav_metrics')
-+    config += structure(source, 'companion_enemy') + structure(source, 'companion_body')
++    config += structure(source, 'companion_enemy') + structure(source, 'companion_combat_profile') + structure(source, 'companion_combat_metrics') + structure(source, 'companion_body')
 +    code = '\n'.join(function(source, name) for name in FUNCTIONS).replace('\t', ' ')
++    if fault == 'padding':
++        code = mutated(code, 'if ((sample - 1) * interval < reach + 0.02f)', 'if (TRUE)')
++    if fault == 'overshoot':
++        code = mutated(code, '(distance >= 0.2f &&', '(distance >= 0.2f ||')
++    if fault == 'shortcut':
++        code = mutated(code, 'if (structure_test_pill2d(global_structure_bsp_get(), FALSE,',
++                       'if (FALSE && structure_test_pill2d(global_structure_bsp_get(), FALSE,')
++    if fault == 'local-refit':
++        code = mutated(code, 'if (!safe && companion_body.safety_obstructed && companion_refresh_obstacles(unit_index))',
++                       'if (FALSE && !safe && companion_body.safety_obstructed && companion_refresh_obstacles(unit_index))')
++    if fault == 'throttle':
++        code = mutated(code, 'throttle->i = forward / forward_speed;', 'throttle->i = forward;')
++        code = mutated(code, 'throttle->j = sideways / sideways_speed;', 'throttle->j = sideways;')
 +    if fault == 'cliff':
 +        code = mutated(code, 'if (!cached && !companion_validate_corridor',
 +                       'if (!cached && FALSE && !companion_validate_corridor')
@@ -7066,6 +8392,17 @@ index 0000000000000000000000000000000000000000..973e0a21f87954334eecf4018b8d6736
 +    if fault == 'floor-contact':
 +        code = mutated(code, 'if (!companion_step_clearance(unit_index, &start, &ground))',
 +                       'if (!companion_clearance(unit_index, &start, &ground))')
++    if fault == 'doorway':
++        code = mutated(code, '&end, to_surface, &result)', '&end, NONE, &result)')
++    if fault == 'wall-margin':
++        code = mutated(code, 'if (!sample || !companion_footprint_wall(unit_index, ground, &from, above, below, &support))',
++                       'if (TRUE || !sample || !companion_footprint_wall(unit_index, ground, &from, above, below, &support))')
++    if fault == 'wall-gap':
++        code = mutated(code, 'return companion_ground_sample(unit_index, &near, above, below, support, NULL);',
++                       '*support = *ground; return TRUE;')
++    if fault == 'support-cache':
++        code = mutated(code, 'companion_body.safety_obstructed = FALSE;\n surface = companion_navigation_start(unit_index, &start);\n if (surface == NONE)',
++                       'companion_body.safety_obstructed = FALSE;\n surface = companion_navigation_start(unit_index, &start);\n if (biped->biped.support_surface_index == NONE || surface == NONE)')
 +    if fault == 'retry':
 +        code = mutated(code, 'now >= companion_body.next_path_time', '1')
 +    if fault == 'pending':
@@ -7082,10 +8419,15 @@ index 0000000000000000000000000000000000000000..973e0a21f87954334eecf4018b8d6736
 +    assert status == 0, output
 +
 +
-+@pytest.mark.parametrize('fault,case', [('retry','retry-budget'), ('failure','failed-path'), ('pending','running-follow'), ('cache-boundary','cache-boundary'), ('cliff','cliff'), ('floor-contact','floor-contact')])
++@pytest.mark.parametrize('fault,case', [('retry','retry-budget'), ('failure','failed-path'), ('pending','running-follow'), ('cache-boundary','cache-boundary'), ('cliff','cliff'), ('floor-contact','floor-contact'), ('doorway','doorway-transition'), ('support-cache','missing-support-cache'), ('wall-margin','wall-parallel'), ('wall-gap','wall-footprint-gap'), ('padding','padding-prefix'), ('overshoot','waypoint-overshoot'), ('shortcut','waypoint-corner-blocked'), ('local-refit','dynamic-blocker'), ('throttle','aiming-movement')])
 +def test_negative_control(fault, case):
 +    status, output = run(build('companion', generated(fault)), case)
 +    assert status == CHECK_FAILED, output
++
++
++def test_control_uses_route_throttle():
++    control = function(read('port/linux/game/companion.c'), 'companion_control')
++    assert 'companion_movement_throttle(unit_index, &walk, &facing, &control.throttle);' in control
 +
 +
 +if __name__ == '__main__':
@@ -7098,7 +8440,7 @@ index 0000000000000000000000000000000000000000..973e0a21f87954334eecf4018b8d6736
 +    source = args.baseline_source.read_text()
 +    config = '#define BASELINE_COMPANION 1\n' + enum_with(source, '_companion_order_follow') + enum_with(source, '_companion_nav_idle')
 +    config += structure(source, 'companion_enemy') + structure(source, 'companion_body')
-+    original_functions = ['companion_navigation_radius', 'companion_flat_distance', 'companion_ground', 'companion_clearance',
++    original_functions = ['companion_navigation_radius', 'companion_flat_distance', 'companion_surface_from', 'companion_goal_surface', 'companion_ground', 'companion_clearance',
 +                          'companion_safe_direction', 'companion_try_jump', 'companion_progress_stalled', 'companion_retry_ticks',
 +                          'companion_follow_goal', 'companion_goal', 'companion_find_path', 'companion_walk_direction', 'companion_catch_up']
 +    code = '\n'.join(function(source, name) for name in original_functions)
@@ -7109,10 +8451,10 @@ index 0000000000000000000000000000000000000000..973e0a21f87954334eecf4018b8d6736
 +        print(f'{name}: {output}')
 diff --git a/tools/harness/tests/test_companion_combat.py b/tools/harness/tests/test_companion_combat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..608465d934155a9c3241910efec043f4d8bb11b4
+index 0000000000000000000000000000000000000000..7817a3cad64ae79fb66c04bac93ff6840aecc661
 --- /dev/null
 +++ b/tools/harness/tests/test_companion_combat.py
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,83 @@
 +"""Native targeting, fire safety, command parsing and persistent orders."""
 +import sys
 +import re
@@ -7121,18 +8463,19 @@ index 0000000000000000000000000000000000000000..608465d934155a9c3241910efec043f4
 +sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 +from harness import build, read, function, structure, enum_with, mutated, run, CHECK_FAILED
 +FUNCTIONS = ['companion_enemy_team','companion_unit_alive','companion_enemy_get','companion_current_target',
-+             'companion_weapon_range','companion_engagement_range','companion_friendly_cone',
-+             'companion_safe_shot','companion_target_eligible','companion_update_target','companion_in_combat','companion_trigger_on',
++             'companion_combat_ticks','companion_update_combat_profile','companion_engagement_range',
++             'companion_recent_threat','companion_refresh_enemy','companion_enemy_in_view','companion_firing_origin','companion_aim_solution','companion_friendly_cone',
++             'companion_safe_shot','companion_target_eligible','companion_update_target','companion_in_combat','companion_trigger_on','companion_blocked_target','companion_fire_requested','companion_reload_needed','companion_look_around',
 +             'companion_set_order','companion_message_value','companion_message_number',
 +             'companion_context_current','companion_capture_context','companion_apply_command','companion_reset_body']
-+CASES = ['combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
++CASES = ['combat-measure-blocked', 'marine-transition-vision', 'blocked-retarget', 'native-profile-override', 'minimum-range', 'unsupported', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'aim-failure', 'head-visibility', 'marine-vision', 'recent-attacker', 'dead-occluded', 'muzzle-safety', 'actual-ray-safety', 'friendly-entry', 'friendly-intended-and-actual', 'reload-and-heat', 'weapon-change', 'semi-bursts', 'fire-and-orders', 'sensing-budget', 'combat-measure', 'combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
 +         'trigger','captured-aim','orders','reject-location','context','parser','reset']
 +
 +
-+def generated(fault=None):
++def generated(fault=None, native=False):
 +    source=read('port/linux/game/companion.c')
 +    config=enum_with(source,'_companion_order_follow')+enum_with(source,'_companion_nav_idle')
-+    for name in ['companion_corridor','companion_nav_metrics','companion_enemy','companion_body','companion_command_context']:
++    for name in ['companion_corridor','companion_nav_metrics','companion_enemy','companion_combat_profile','companion_combat_metrics','companion_shot','companion_body','companion_command_context']:
 +        config+=structure(source,name)
 +    # The standard harness extractor counts braces in character literals.
 +    # Mask literals/comments for locating boundaries, then compile the original.
@@ -7143,12 +8486,28 @@ index 0000000000000000000000000000000000000000..608465d934155a9c3241910efec043f4
 +        body=function(masked,name)
 +        start=masked.index(body)
 +        pieces.append(source[start:start+len(body)])
++    if native:
++        config = '#define NATIVE_WEAPON_MATH 1\n' + config
++        projectile = read('source/items/projectiles.c')
++        weapon = read('source/items/weapons.c')
++        pieces = [function(projectile, name) for name in
++                  ['projectile_estimate_time_to_target', 'projectile_aim_linear', 'projectile_aim']] + [
++                      function(weapon, 'weapon_estimate_time_to_target'), function(weapon, 'weapon_aim'),
++                      function(read('source/units/units.c'), 'unit_adjust_projectile_ray')] + pieces
 +    code='\n'.join(pieces)
++    if fault=='lead':
++        code=mutated(code,'ticks * profile->lead, &shot->target);','0.f, &shot->target);')
++    if fault=='actual':
++        code=mutated(code,'ray < 2; ray++','ray < 1; ray++')
++    if fault=='burst-pause':
++        code=mutated(code,'if (phase >= on) return FALSE;','if (!latched && phase >= on) return FALSE;')
++    if fault=='sensing':
++        code=mutated(code,'if (game_time_get() < companion_body.enemy_scan_time) return;', 'if (FALSE) return;')
++    if fault=='muzzle':
++        code=mutated(code,'*origin = marker.matrix.position;', '*origin = marker.matrix.position; origin->z = 0.f;')
 +    if fault=='visibility':
 +        code=mutated(code,'return enemy && enemy->visible && enemy->distance <= range &&',
 +                     'return enemy && enemy->distance <= range &&')
-+        code=mutated(code,'!enemy || !enemy->visible || !companion_unit_alive(enemy->unit_index)',
-+                     '!enemy || !companion_unit_alive(enemy->unit_index)')
 +    if fault=='friendly':
 +        code=mutated(code,'return squared < radius * radius;', 'return squared < -1.f;')
 +    return (('config.inc',config),('under_test.inc',code))
@@ -7160,10 +8519,77 @@ index 0000000000000000000000000000000000000000..608465d934155a9c3241910efec043f4
 +    assert status==0,output
 +
 +
-+@pytest.mark.parametrize('fault,case',[('visibility','occluded-elite'),('friendly','friendly-fire')])
++@pytest.mark.parametrize('fault,case',[('visibility','occluded-elite'),('friendly','friendly-fire'),('lead','moving-projectile'),('actual','actual-ray-safety'),('burst-pause','semi-bursts'),('sensing','sensing-budget'),('muzzle','muzzle-safety')])
 +def test_negative_control(fault,case):
 +    status,output=run(build('companion_combat',generated(fault)),case)
 +    assert status==CHECK_FAILED,output
++
++
++@pytest.mark.parametrize('case', ['stationary-solution', 'moving-projectile', 'vehicle-lead', 'native-profile-override', 'minimum-range', 'unsupported', 'origin-camera', 'combat-measure-blocked'])
++def test_native_weapon_adapter(case):
++    status, output = run(build('companion_combat', generated(native=True)), case)
++    assert status == 0, output
++
++
++def test_combat_control_wiring():
++    control = function(read('port/linux/game/companion.c'), 'companion_control')
++    assert 'companion_refresh_enemy(unit_index, target)' in control
++    assert 'companion_aim_solution(unit_index, target, &shot)' in control
++    assert 'solution && companion_fire_requested(unit_index, target, &shot)' in control
++    assert 'companion_reload_needed(held_weapon_index)' in control
++    assert 'companion_movement_throttle(unit_index, &walk, &facing, &control.throttle)' in control
+diff --git a/tools/harness/tests/test_companion_obstacles.py b/tools/harness/tests/test_companion_obstacles.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e6030d5982f02778532a1751f0253cc1ceeef85
+--- /dev/null
++++ b/tools/harness/tests/test_companion_obstacles.py
+@@ -0,0 +1,46 @@
++"""Companion refits through the real native disc/tangent solver; flat BSP fixture."""
++import sys
++from pathlib import Path
++import pytest
++sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++from harness import build, read, function, structure, enum_with, mutated, run, CHECK_FAILED
++
++OBSTACLES = ['obstacles_new', 'obstacles_add_disc', 'circle_intersect_ray', 'circle_tangents',
++             'obstacles_test_circle', 'obstacles_test_pill', 'obstacles_disc_tangents',
++             'obstacles_disc_neighborhood', 'obstacles_recompute']
++AVOIDANCE = ['obstacle_from_disc', 'path_get_step', 'path_get_step_index', 'heap_parent_index',
++             'heap_left_index', 'heap_right_index', 'heap_cost', 'error_heap', 'heap_verify',
++             'heap_up', 'heap_down', 'heap_insert', 'heap_remove', 'path_add_step', 'path_new',
++             'path_test_pill2d', 'path_add_steps', 'path_iterate', 'path_find', 'path_avoid_obstacles']
++
++
++def generated(fault=False):
++    header = read('source/ai/path.h')
++    avoid = read('source/ai/path_obstacle_avoidance.c')
++    obstacles = read('source/ai/path_obstacles.c')
++    companion = read('port/linux/game/companion.c')
++    config = enum_with(header, 'MAXIMUM_DISC_COUNT') + enum_with(header, '_disc_optional_bit')
++    for name in ['path_destination', 'path_step', 'path_result', 'path_input', 'obstacle_disc',
++                 'obstacles', 'obstacle_path_step', 'obstacle_path', 'obstacles_test_pill_result']:
++        config += structure(header, name)
++    config += structure(avoid, 'path_test_pill2d_result')
++    config += structure(read('source/ai/path_structure_bsp.h'), 'structure_test_ray2d_result')
++    for name in ['companion_corridor', 'companion_nav_metrics', 'companion_combat_profile', 'companion_combat_metrics', 'companion_body']:
++        config += structure(companion, name)
++    parts = [function(obstacles, n) for n in OBSTACLES] + [function(avoid, n) for n in AVOIDANCE]
++    parts += [function(companion, 'companion_refresh_obstacles')]
++    code = '\n'.join(p.split('{', 1)[0] + ';' for p in parts) + '\n' + '\n'.join(parts)
++    if fault:
++        code = mutated(code, 'return result->disc_index != NONE;', 'return FALSE;')
++    return (('config.inc', config), ('under_test.inc', code))
++
++
++@pytest.mark.parametrize('case', ['detour', 'blocker-moves', 'blocked-corridor', 'fresh-start', 'partial-route'])
++def test_native_refit(case):
++    status, output = run(build('companion_obstacles', generated()), case)
++    assert status == 0, output
++
++
++def test_native_negative_control():
++    status, output = run(build('companion_obstacles', generated(True)), 'detour')
++    assert status == CHECK_FAILED, output
 diff --git a/tools/port_settings.py b/tools/port_settings.py
 index 6e8028f85df9191d81ad20af6fcffc268d710e5a..9d4e079f6cfadd8a65087bd384f5123a599bdb48 100644
 --- a/tools/port_settings.py

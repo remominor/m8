@@ -129,3 +129,97 @@ for movement/combat acceptance. Also check natural spoken command variations, am
 LAN chat/history, response latency and optional navigation counters on ordinary corridors,
 doors, ramps and near ledges. Gameplay acceptance and actual map CPU timings remain pending.
 Gameplay logs are inspected only when explicitly requested.
+
+## Doorway transition correction after gameplay
+
+The first live Pillar of Autumn report showed Kevin stopped at a supported corridor doorway.
+The terminal recorded `traverse=5 build=5` (successful path search/build), followed by
+`state=4` (terrain rejected) at goal `(-30.12, 36.45, 0.01)`, about 0.67 world units away.
+The old diagnostics did not identify the individual failed probe, and the OS denied debugger
+attachment, so the exact original rejection branch was not captured.
+
+The safety controller now retains the collision face identified by each ground ray. It passes
+both known endpoint faces directly to Halo's `structure_test_line2d`, which handles boundary
+cases that the former unknown-destination surface lookup could reject. The actual supporting
+face also anchors validation when the biped's cached pathfinding face belongs to the other side
+of the seam. Both faces must remain marked walkable, and the connection must reach the sampled
+point with matching elevation. Existing footprint, slope/drop, collision, cache-containment and
+jump checks remain in force. Navigation rejection messages now include the failed check and
+probe coordinates to distinguish missing/steep support, footprint elevation, BSP transition
+and physical obstruction on the next run. Native messages are written to the game's terminal
+stderr; `debug.txt` does not capture these platform messages.
+
+A synthetic doorway regression failed against the old controller before the change. New cases
+cover supported doorway crossing, following across that threshold, actual BSP obstruction,
+nonwalkable faces, and a cliff beyond the doorway; a negative control removes the known target
+face. **396 native harness checks pass**. Stable-run query counts remain 1,440 ground probes and
+270 BSP queries over 90 ticks. The Linux release target was rebuilt, and the portable patch was
+verified against a separate clean pinned checkout with all 44 resulting files matching. The
+previous executable is preserved at `halo/build/linux/halo.before-corridor-fix`.
+
+Replay the reported doorway after launching the rebuilt game to verify this correction in the
+actual map. The harness reproduction is not a claim that the live doorway has passed yet.
+
+## Missing biped support cache correction
+
+The next live run reached `(-29.921, 30.021, 0.007)` and repeatedly logged
+`safety=current support surface`, with successful path results. This reason identifies a
+short-circuit rejection on a missing cached biped support/navigation index: the footprint rays
+had not run. The preceding seam correction addressed a later check and did not resolve this
+blocker. Two regression cases reproduced that rejection before changing the cache guard.
+
+Navigation now derives its start from a fresh five-point structure-ground footprint and the
+hit face's walkable navigation flag. A missing biped cache is neither proof of unsafe ground
+nor permission to move: the actual rays, slope/drop checks, BSP connections and physical
+capsule sweep must still pass. Path searches and goal-surface lookup use this same verified
+start, so they do not reintroduce the missing-cache failure. Cached indices can still invalidate
+previously validated corridors when they change, but cannot prevent fresh validation.
+
+Exhausted terrain recovery checks local safety again at most every five simulation seconds.
+It resumes path search only when that check succeeds; a persistent cliff still idles without
+launching searches. Missing ray hits and steep/invalid hits now have distinct diagnostic reasons.
+The navigation harness extracts the real start/goal-surface helpers instead of stubbing them.
+New tests cover missing physical support, missing navigation cache, both missing while following,
+actual cliffs/missing ground, safe recovery wakeup and bounded rejection while unsafe. A negative
+control reinstates the old support-cache guard and must fail.
+
+**402 native checks pass**, the Linux release target builds, and the refreshed portable patch
+again applies to a separate clean pinned checkout with all 44 files matching. Stable-run counts
+remain 1,440 ground probes and 270 BSP trajectory queries per 90 ticks. The executable from the
+previous run is preserved at `halo/build/linux/halo.before-support-cache-fix`. The player
+subsequently confirmed this correction fixed that case. The Rust release binary was also
+rebuilt to include the requested unsolicited-speech prompt.
+
+
+## Wall-side footprint correction
+
+The following live report repeated successful path results followed by `no structure hit under
+footprint` at `(-51.749, 35.970, 0.000)`, with a goal about 0.67 world units away. Read-only
+inspection of the extracted a10 collision geometry established that this ray lies inside a
+solid wall, not over an exposed floor edge. In BSP 3, floor face 71 ends at y=36.0287; vertical
+base face 1112 rises there to z=0.1, bevel face 1579 meets wall face 39 at y=35.9787, z=0.15,
+and that wall continues to z=1.0. The five-point footprint's extra margin could enter this wall
+and incorrectly stop an otherwise supported corridor trajectory. The harness reproduced this
+rejection with the logged probe coordinates and the adjacent wall/base dimensions before the fix.
+
+Only an outer footprint sample can now use the wall case. It requires front-facing, near-vertical
+fixed structure hits between the supported center and the edge at both foot and standing-body
+heights, with consistent normals. A fresh ground ray immediately on the near side of the wall
+must also pass the existing support/slope/elevation checks; a wall across a gap cannot supply
+support. The center always needs actual walkable floor. Existing BSP continuity, capsule
+clearance, stopping corridor/cache bounds and jump checks remain mandatory. These extra rays
+run only after an outer support probe fails. Debug query totals include `wall_probes`, and
+rate-limited rejection diagnostics now identify the validation stage, origin and waypoint.
+
+New cases cover the reported geometry, repeated movement beside a wall, exposed edges, low
+curbs, object/back-facing/invalid wall hits, unsupported centers, a gap before a wall, actual
+body obstruction, and unsafe jumping. Negative controls remove the wall handling and the
+near-wall ground requirement and must fail. **410 native harness checks pass**. Stable 90-tick
+movement remains at 1,440 ground probes and 270 BSP queries (60% and 62.5% below the Sprint 1
+baseline respectively), with 30 full validations, 60 cache reuses and 90 capsule sweeps.
+
+The portable patch applies to a separate clean pinned checkout with all 44 files matching,
+including all 39 original patched files and previous binary assets. The Linux release target
+is rebuilt; the previous executable is preserved at `halo/build/linux/halo.before-wall-footprint-fix`.
+Replay after relaunching Halo is still needed to confirm the live result. The currently running
+game was not restarted or modified in memory.
