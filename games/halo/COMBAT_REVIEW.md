@@ -79,8 +79,8 @@ Actual combat competence and map collision/animation still require gameplay.
 - `companion_update_combat_profile` (`companion.c:840`) caches the loaded Marine
   firing/vision metadata and weapon overrides until the held weapon changes or
   the companion resets. A matching weapon variant is preferred; otherwise a
-  loaded Marine's ordinary settings supply the baseline. No weapon-name matching
-  remains. Projectile range, minimum target range and conservative unsupported
+  loaded Marine supplies perception only; generic firing defaults use the actual
+  projectile. No weapon-name matching remains. Projectile range, minimum target range and conservative unsupported
   projectile/trigger checks are applied before enabling autonomous firing.
 - `companion_enemy_in_view` (`:1021`) adapts the native partial-distance angular
   interpolation, including the January perception view's field ordering. The
@@ -208,3 +208,47 @@ No gameplay was driven or restarted, and no live gameplay logs were inspected.
   helpers match the source before this combat pass.
 - No conversational/model/server/web/voice code was changed by this pass. The
   existing uncommitted speech prompt and previous navigation changes remain.
+
+
+## Live non-engagement correction
+
+The first gameplay report after this review exposed a weapon eligibility error.
+Live m8 state showed fire enabled, follow active and an assault rifle with 24
+rounds loaded. Terminal output showed no acquired targets; optional combat query
+logging was disabled. Read-only inspection of the extracted a10 tags established
+that both the AR and pistol projectiles have `air_gravity_scale = 1` with
+projectile flags zero. The controller rejected any positive gravity, so these
+weapons received a zero engagement range and could never acquire a target.
+
+The engine's `projectile_aim` selects ballistic aiming only when **both** its
+private ballistic flag (bit 1) and positive air gravity are present. Kevin now
+uses that same condition. Ordinary rifle/pistol linear aiming is enabled;
+ballistic/area/charged weapons retain their existing conservative restrictions.
+Friendly-fire checks still gate every requested shot.
+
+Three additional review findings are corrected with this fix:
+
+- A fallback Marine supplies perception only. Firing metadata comes from a
+  matching weapon variant or explicit weapon override. Otherwise cadence and
+  reaction use the existing generic defaults, lead remains one, and range comes
+  from the actual projectile damage/max range, capped at 12 world units and by
+  vision/projectile limits.
+- Empty `(0, 0)` burst duration/separation bounds retain generic burst defaults.
+  A genuine zero reaction delay is allowed, and specified intervals starting at
+  zero remain valid.
+- A missing primary trigger marker suspends fire and logs weapon, definition and
+  effect object IDs once per outage. Marker recovery is logged once. This origin
+  failure does not mark a target obstructed or put it on a targeting cooldown.
+
+Four regressions failed against the previous controller, both with fake aim and
+with extracted native weapon/projectile functions (eight failures). They cover
+actual a10 rifle gravity/flags, linear-versus-ballistic combinations, acquisition
+and friendly exclusion, unrelated Marine firing data, empty timing geometry and
+marker failure/recovery diagnostics. Existing movement helpers remain untouched.
+The running game was neither restarted nor changed in memory. Relaunch is
+necessary to verify the rebuilt controller in gameplay.
+
+Verification: **484 native harness checks pass**, including **63 combat checks**.
+The Linux release target builds, and the regenerated portable patch applies to a
+separate clean pinned checkout; all 46 patched files match byte for byte and all
+39 original paths/binary assets remain preserved.

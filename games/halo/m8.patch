@@ -1761,10 +1761,10 @@ index def58c7fbe4393450aaf5408ea57484347bdd493..f0bfa6566835845347c96ff26d251eba
  | `debug.menu_open` | `""` | `HALO_MENU_OPEN` | Start on this screen of the menus (`main_menu/settings_select/...`, as `port/assets/menus` names it), a player profile being edited, to look at it. |
 diff --git a/port/linux/game/companion.c b/port/linux/game/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715366ab26f
+index 0000000000000000000000000000000000000000..6846717b23bfe92b59069b5ee983fc2ca986da59
 --- /dev/null
 +++ b/port/linux/game/companion.c
-@@ -0,0 +1,4449 @@
+@@ -0,0 +1,4472 @@
 +/*
 +COMPANION.C
 +
@@ -2027,6 +2027,7 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +	boolean initialized;
 +	boolean supported;
 +	boolean latched;
++	boolean origin_missing;
 +	long weapon_index;
 +	real range, minimum, vision, peripheral, central_cosine, peripheral_cosine;
 +	real central_angle, transition_angle;
@@ -2597,11 +2598,12 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +/* Native actor firing parameters, without constructing actor/prop state.
 +The weapon's explicit override wins; otherwise use a loaded Marine variant
 +for this weapon. Vision always starts from a Marine's perception definition. */
-+static long companion_combat_ticks(real low, real high, long fallback)
++static long companion_combat_ticks(real low, real high, long fallback, boolean immediate)
 +{
 +	real mean = (low + high) * 0.5f;
 +
-+	return low >= 0.f && high >= low && mean <= 10.f ? (long)(mean * TICKS_PER_SECOND) : fallback;
++	/* Zero reaction delay is intentional; empty burst geometry is unspecified. */
++	return low >= 0.f && high >= low && mean <= 10.f && (immediate || high > 0.f) ? (long)(mean * TICKS_PER_SECOND) : fallback;
 +}
 +
 +static void companion_update_combat_profile(long unit_index)
@@ -2646,7 +2648,7 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +		actor = actor_definition_get(variant->actor_reference.index);
 +		if (actor->type != _actor_marine)
 +			continue;
-+		if (!marine) { marine = actor; firing = variant; }
++		if (!marine) marine = actor;
 +		if (weapon && variant->ranged_combat.reference.index == weapon_get(weapon_index)->definition_index)
 +		{
 +			marine = actor;
@@ -2675,11 +2677,11 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +		profile->range = MAX(0.f, ranged->maximum_firing_range);
 +		profile->lead = PIN(ranged->target_lead_fraction, 0.f, 1.f);
 +		profile->burst_ticks = MAX(1, companion_combat_ticks(ranged->burst_geometry.burst_duration_lower_bound,
-+			ranged->burst_geometry.burst_duration_upper_bound, profile->burst_ticks));
++			ranged->burst_geometry.burst_duration_upper_bound, profile->burst_ticks, FALSE));
 +		profile->pause_ticks = MAX(1, companion_combat_ticks(ranged->burst_geometry.burst_separation_lower_bound,
-+			ranged->burst_geometry.burst_separation_upper_bound, profile->pause_ticks));
++			ranged->burst_geometry.burst_separation_upper_bound, profile->pause_ticks, FALSE));
 +		profile->reaction_ticks = companion_combat_ticks(ranged->first_burst_delay_lower_bound,
-+			ranged->first_burst_delay_upper_bound, profile->reaction_ticks);
++			ranged->first_burst_delay_upper_bound, profile->reaction_ticks, TRUE);
 +	}
 +	{
 +		struct weapon_trigger_definition *trigger = TAG_BLOCK_GET_ELEMENT(&weapon->weapon.triggers, 0, struct weapon_trigger_definition);
@@ -2690,7 +2692,10 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +			FLAG(_weapon_trigger_projectiles_cannot_be_aimed_bit))))
 +			return;
 +		projectile = projectile_definition_get(trigger->projectile.index);
-+		if (!(projectile->projectile.initial_velocity > 0.f) || projectile->projectile.air_gravity_scale > 0.f ||
++		/* Match projectile_aim: ordinary AR/pistol bullets have gravity but
++		use linear aiming. Bit 1 is projectiles.c's private ballistic-aim flag. */
++		if (!(projectile->projectile.initial_velocity > 0.f) ||
++			(TEST_FLAG(projectile->projectile.flags, 1) && projectile->projectile.air_gravity_scale > 0.f) ||
 +			projectile->projectile.danger_radius > 0.f || projectile->projectile.super_detonation.index != NONE ||
 +			projectile->projectile.attached_detonation_damage.index != NONE ||
 +			TEST_FLAG(projectile->projectile.flags, 3)) /* native super-combining projectile flag */
@@ -2698,7 +2703,15 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +		if (projectile->projectile.impact_damage.index != NONE &&
 +			damage_effect_definition_get(projectile->projectile.impact_damage.index)->cutoff_radius > 0.f)
 +			return;
-+		if (!firing) profile->range = projectile->projectile.air_damage_range_upper_bound;
++		if (!firing)
++		{
++			/* No matching soldier variant: use this projectile's useful range,
++			with a conservative cap and the generic cadence initialized above. */
++			real useful = projectile->projectile.air_damage_range_upper_bound;
++
++			if (!(useful > 0.f)) useful = projectile->projectile.maximum_range;
++			profile->range = useful > 0.f ? MIN(useful, 12.f) : 12.f;
++		}
 +		if (!(profile->range > 0.f)) profile->range = projectile->projectile.maximum_range;
 +		if (projectile->projectile.maximum_range > 0.f)
 +			profile->range = MIN(profile->range, projectile->projectile.maximum_range);
@@ -2830,7 +2843,17 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +	real_vector3d direction = *aim;
 +	real velocity;
 +
-+	if (!object_get_marker_by_name(effect, "primary trigger", &marker, 1)) return FALSE;
++	if (!object_get_marker_by_name(effect, "primary trigger", &marker, 1))
++	{
++		if (!companion_body.combat.origin_missing)
++			platform_log("Kevin combat: missing primary trigger marker weapon=%08lx definition=%08lx effect=%08lx; firing suspended",
++				weapon_index, weapon->definition_index, effect);
++		companion_body.combat.origin_missing = TRUE;
++		return FALSE;
++	}
++	if (companion_body.combat.origin_missing)
++		platform_log("Kevin combat: primary trigger marker restored weapon=%08lx; firing available", weapon_index);
++	companion_body.combat.origin_missing = FALSE;
 +	*origin = marker.matrix.position;
 +	unit_adjust_projectile_ray(unit_index, origin, &direction, &velocity,
 +		TEST_FLAG(definition->unit.flags, _unit_fires_from_camera_bit), FALSE);
@@ -3083,7 +3106,7 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +	if (!companion_safe_shot(unit_index, enemy, shot))
 +	{
 +		companion_body.combat_metrics.blocked++;
-+		companion_blocked_target(enemy->unit_index);
++		if (!profile->origin_missing) companion_blocked_target(enemy->unit_index);
 +		return FALSE;
 +	}
 +	companion_body.target_blocked_since = 0;
@@ -4585,7 +4608,7 @@ index 0000000000000000000000000000000000000000..b2ae771f032ed2e11809f6fab5ca1715
 +	companion_update_combat_profile(unit_index);
 +	if (target) companion_refresh_enemy(unit_index, target);
 +	solution = companion_aim_solution(unit_index, target, &shot);
-+	if (!solution && target && target->visible && companion_body.combat.supported)
++	if (!solution && target && target->visible && companion_body.combat.supported && !companion_body.combat.origin_missing)
 +		companion_blocked_target(target->unit_index);
 +	/* (his own, as any soldier's: a magazine run dry is reloaded, if there's
 +	ammo for it) */
@@ -7833,10 +7856,10 @@ index 0000000000000000000000000000000000000000..9ac8596b550c910f0de738cd0166281d
 +}
 diff --git a/tools/harness/tests/companion_combat.c b/tools/harness/tests/companion_combat.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..5968397f3b3c67f0b6a48466fe0f0c568ecf179c
+index 0000000000000000000000000000000000000000..7bb113203f6477bf725b5772bcc2de66d5e71f69
 --- /dev/null
 +++ b/tools/harness/tests/companion_combat.c
-@@ -0,0 +1,373 @@
+@@ -0,0 +1,428 @@
 +#include "harness.h"
 +#include <math.h>
 +#undef CASE
@@ -7880,7 +7903,11 @@ index 0000000000000000000000000000000000000000..5968397f3b3c67f0b6a48466fe0f0c56
 +#define MIN(a,b) ((a)<(b)?(a):(b))
 +#define MAX(a,b) ((a)>(b)?(a):(b))
 +#define PIN(a,b,c) MIN(MAX(a,b),c)
-+static void platform_log(const char *format, ...) {(void)format;}
++static int missing_origin_logs, restored_origin_logs;
++static void platform_log(const char *format, ...) {
++ if(strstr(format,"missing primary trigger marker"))missing_origin_logs++;
++ if(strstr(format,"primary trigger marker restored"))restored_origin_logs++;
++}
 +#define csmemset memset
 +#define config_boolean(a) 0
 +struct path_result { int unused; };
@@ -8003,6 +8030,57 @@ index 0000000000000000000000000000000000000000..5968397f3b3c67f0b6a48466fe0f0c56
 + companion_update_combat_profile(0);
 + companion_body.target_unit_index=NONE;companion_body.aim.i=1;
 + companion_enemy_count=2;companion_enemies[0]=(struct companion_enemy){2,5,TRUE,{5,0,0}};companion_enemies[1]=(struct companion_enemy){3,8,TRUE,{8,0,0}};
++ CASE("a10-linear-gravity"){
++  fake_projectile.projectile.initial_velocity=10.8f;
++  fake_projectile.projectile.air_gravity_scale=1.f; /* extracted a10 AR/pistol: gravity, no ballistic flag */
++  held_weapon++;companion_update_combat_profile(0);
++  CHECK(companion_engagement_range(0)==13,"ordinary rifle gravity must not disable autonomous engagement");
++  companion_update_target(0);CHECK(companion_body.target_unit_index==2,"rifle acquires visible enemy");
++  ready_shot(&shot);CHECK(companion_fire_requested(0,&companion_enemies[0],&shot),"native linear rifle can fire");
++  units[1].object.bounding_sphere_center=(real_point3d){2,0,0};
++  CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"corrected rifle still stops for Chief");
++  fake_projectile.projectile.flags=FLAG(1);held_weapon++;companion_update_combat_profile(0);
++  CHECK(!companion_body.combat.supported,"ballistic flag plus gravity remains unsupported");
++  fake_projectile.projectile.air_gravity_scale=0;held_weapon++;companion_update_combat_profile(0);
++  CHECK(companion_body.combat.supported&&companion_aim_solution(0,&companion_enemies[0],&shot),"ballistic flag without gravity uses native linear solver");
++ }
++ CASE("unmatched-firing-profile"){
++  fake_variant.ranged_combat.reference.index=99;
++  fake_variant.ranged_combat.maximum_firing_range=1;
++  fake_variant.ranged_combat.target_lead_fraction=0;
++  fake_variant.ranged_combat.burst_geometry=(struct actor_burst_geometry){3,3,4,4};
++  fake_variant.ranged_combat.first_burst_delay_lower_bound=fake_variant.ranged_combat.first_burst_delay_upper_bound=5;
++  fake_variant.ranged_combat.modified_vision_range=2;
++  fake_projectile.projectile.air_damage_range_upper_bound=7;
++  held_weapon++;companion_update_combat_profile(0);
++  CHECK(companion_engagement_range(0)==7,"unmatched Marine firing range cannot override actual projectile range");
++  CHECK(companion_body.combat.vision==40&&companion_body.combat.lead==1,"fallback supplies perception only");
++  CHECK(companion_body.combat.burst_ticks==18&&companion_body.combat.pause_ticks==9&&companion_body.combat.reaction_ticks==12,"generic cadence cannot inherit other weapon");
++  fake_projectile.projectile.air_damage_range_upper_bound=0;held_weapon++;companion_update_combat_profile(0);
++  CHECK(companion_engagement_range(0)==12,"absent damage range uses bounded actual maximum range");
++  override_variant=fake_variant;override_variant.ranged_combat.maximum_firing_range=8;override_variant.ranged_combat.modified_vision_range=0;
++  test_weapon_definition.weapon.ai_firing_parameters.index=2;held_weapon++;companion_update_combat_profile(0);
++  CHECK(companion_engagement_range(0)==8&&companion_body.combat.burst_ticks==90,"explicit weapon override still supplies firing metadata");
++ }
++ CASE("unspecified-burst-geometry"){
++  fake_variant.ranged_combat.burst_geometry=(struct actor_burst_geometry){0,0,0,0};
++  fake_variant.ranged_combat.first_burst_delay_lower_bound=fake_variant.ranged_combat.first_burst_delay_upper_bound=0;
++  held_weapon++;companion_update_combat_profile(0);
++  CHECK(companion_body.combat.burst_ticks==18&&companion_body.combat.pause_ticks==9,"absent burst geometry retains useful defaults");
++  CHECK(companion_body.combat.reaction_ticks==0,"explicit immediate reaction remains valid");
++  fake_variant.ranged_combat.burst_geometry=(struct actor_burst_geometry){0,0.4f,0,0.2f};
++  held_weapon++;companion_update_combat_profile(0);
++  CHECK(companion_body.combat.burst_ticks==6&&companion_body.combat.pause_ticks==3,"specified intervals starting at zero remain valid");
++ }
++ CASE("missing-origin-diagnostic"){
++  missing_marker=TRUE;
++  for(i=0;i<90;i++)CHECK(!companion_aim_solution(0,&companion_enemies[0],&shot),"missing origin always fails closed");
++  CHECK(missing_origin_logs==1,"missing marker identified once per outage, not every tick");
++  CHECK(companion_body.target_blocked_since==0,"missing marker cannot masquerade as target obstruction");
++  missing_marker=FALSE;
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot)&&restored_origin_logs==1,"marker recovery resumes native aim and reports once");
++  CHECK(companion_aim_solution(0,&companion_enemies[0],&shot)&&restored_origin_logs==1,"successful lookups do not spam");
++ }
 + CASE("native-profile-override"){
 +  override_variant=fake_variant;override_variant.ranged_combat.maximum_firing_range=22;
 +  override_variant.ranged_combat.first_burst_delay_lower_bound=override_variant.ranged_combat.first_burst_delay_upper_bound=0.2f;
@@ -8025,7 +8103,7 @@ index 0000000000000000000000000000000000000000..5968397f3b3c67f0b6a48466fe0f0c56
 +   fake_projectile.projectile.danger_radius=kind==1?1:0;
 +   fake_projectile.projectile.super_detonation.index=kind==2?30:NONE;
 +   fake_projectile.projectile.attached_detonation_damage.index=kind==3?30:NONE;
-+   fake_projectile.projectile.flags=kind==4?FLAG(3):0;
++   fake_projectile.projectile.flags=kind==4?FLAG(3):kind==0?FLAG(1):0;
 +   fake_projectile.projectile.impact_damage.index=kind==5?30:NONE;fake_damage.cutoff_radius=1;
 +   fake_trigger.charging_time=kind==6?1:0;
 +   fake_trigger.flags=kind==7?FLAG(_weapon_trigger_uses_weapon_origin_bit):kind==8?FLAG(_weapon_trigger_projectiles_cannot_be_aimed_bit):0;
@@ -8451,10 +8529,10 @@ index 0000000000000000000000000000000000000000..1e9b6098c971d25cc8d31d4192b96732
 +        print(f'{name}: {output}')
 diff --git a/tools/harness/tests/test_companion_combat.py b/tools/harness/tests/test_companion_combat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..7817a3cad64ae79fb66c04bac93ff6840aecc661
+index 0000000000000000000000000000000000000000..d0904a531a018973155d67a862896c9ee403d3ee
 --- /dev/null
 +++ b/tools/harness/tests/test_companion_combat.py
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,84 @@
 +"""Native targeting, fire safety, command parsing and persistent orders."""
 +import sys
 +import re
@@ -8468,7 +8546,7 @@ index 0000000000000000000000000000000000000000..7817a3cad64ae79fb66c04bac93ff684
 +             'companion_safe_shot','companion_target_eligible','companion_update_target','companion_in_combat','companion_trigger_on','companion_blocked_target','companion_fire_requested','companion_reload_needed','companion_look_around',
 +             'companion_set_order','companion_message_value','companion_message_number',
 +             'companion_context_current','companion_capture_context','companion_apply_command','companion_reset_body']
-+CASES = ['combat-measure-blocked', 'marine-transition-vision', 'blocked-retarget', 'native-profile-override', 'minimum-range', 'unsupported', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'aim-failure', 'head-visibility', 'marine-vision', 'recent-attacker', 'dead-occluded', 'muzzle-safety', 'actual-ray-safety', 'friendly-entry', 'friendly-intended-and-actual', 'reload-and-heat', 'weapon-change', 'semi-bursts', 'fire-and-orders', 'sensing-budget', 'combat-measure', 'combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
++CASES = ['a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'combat-measure-blocked', 'marine-transition-vision', 'blocked-retarget', 'native-profile-override', 'minimum-range', 'unsupported', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'aim-failure', 'head-visibility', 'marine-vision', 'recent-attacker', 'dead-occluded', 'muzzle-safety', 'actual-ray-safety', 'friendly-entry', 'friendly-intended-and-actual', 'reload-and-heat', 'weapon-change', 'semi-bursts', 'fire-and-orders', 'sensing-budget', 'combat-measure', 'combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
 +         'trigger','captured-aim','orders','reject-location','context','parser','reset']
 +
 +
@@ -8525,7 +8603,7 @@ index 0000000000000000000000000000000000000000..7817a3cad64ae79fb66c04bac93ff684
 +    assert status==CHECK_FAILED,output
 +
 +
-+@pytest.mark.parametrize('case', ['stationary-solution', 'moving-projectile', 'vehicle-lead', 'native-profile-override', 'minimum-range', 'unsupported', 'origin-camera', 'combat-measure-blocked'])
++@pytest.mark.parametrize('case', ['a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'native-profile-override', 'minimum-range', 'unsupported', 'origin-camera', 'combat-measure-blocked'])
 +def test_native_weapon_adapter(case):
 +    status, output = run(build('companion_combat', generated(native=True)), case)
 +    assert status == 0, output
@@ -8533,6 +8611,7 @@ index 0000000000000000000000000000000000000000..7817a3cad64ae79fb66c04bac93ff684
 +
 +def test_combat_control_wiring():
 +    control = function(read('port/linux/game/companion.c'), 'companion_control')
++    assert '!companion_body.combat.origin_missing' in control
 +    assert 'companion_refresh_enemy(unit_index, target)' in control
 +    assert 'companion_aim_solution(unit_index, target, &shot)' in control
 +    assert 'solution && companion_fire_requested(unit_index, target, &shot)' in control
