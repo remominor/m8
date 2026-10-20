@@ -331,3 +331,119 @@ and ramp ground projection, near-maximum firing, preferred-range hysteresis,
 blocked-shot repositioning, route failure and the leash boundary. Gameplay is
 still needed to tune real-world positioning and confirm actual movement/fire
 behavior in Halo's collision and animation systems.
+
+## Firing-position evaluation after ae4dab5
+
+### Established causes and native comparison
+
+The earlier correction separates perception, firing range and grounded pursuit,
+but its `companion_combat_goal()` still treats distance as sufficient reason to
+hold. A firing position inside preferred range is never evaluated for LOS or
+friendly obstruction unless an actual fire request first reaches
+`companion_safe_shot()`. Reaction delay, burst timing, weapon readiness and aim
+alignment all precede that check. Consequently a poor firing lane can leave
+Kevin stationary indefinitely without triggering repositioning. The old retreat
+entry and approach-exit conditions also overlap: a too-close target can turn
+movement on, then off on the next tick. The old blocked-position latch has no
+successful-arrival/resolved-obstruction exit.
+
+These are established controller defects. Replacing only the position policy with
+its archived ae4dab5 implementation makes two movement assertions fail: movement
+from a blocked lane inside preferred distance, and sustained retreat across
+successive ticks. The assertions examine movement, without depending on new state
+fields. This does not establish which branch caused the reported live encounter.
+No local Halo process was running during this investigation, and the saved
+terminal captures predate ae4dab5.
+
+At pinned OpenCE `8102e711`, `actor_firing_position.c`'s
+`pre_evaluator_attack()` evaluates weapon/combat ranges;
+`post_evaluator_attack()` separately rewards clear target LOS and can reject
+unusable firing positions. Its movement and friend-attack-vector evaluations
+favor short movement and avoid interfering firing lanes. `actor_moving.c` then
+routes the chosen destination and converts world movement to facing-relative
+throttle. These principles are reusable without fabricating actor data.
+
+Native `units.c` maps `_unit_animation_state_in_combat` to standing/crouching.
+The alert base seat's sideways restriction does not follow from
+`_unit_aiming_speed_alert`. Kevin's animation, aiming settings and speed
+compensation are retained.
+
+### Bounded position controller
+
+- Independently assess the current intended firing lane every 15 ticks, even
+  while aim is misaligned, the weapon is reloading or no trigger is requested.
+  Candidate origins translate the resolved muzzle to each grounded location;
+  they are estimates of future usefulness, never authorization to shoot.
+- Evaluate at most five deterministic local candidates: forward/retreat, two
+  lateral and two forward-lateral. Horizontal displacement is capped at three
+  world units; lateral offsets are 1.2 units. Require supported walkable ground,
+  standing clearance, a clear target ray/friendly cone and Chief's 75-metre
+  leash. All existing trajectory, wall, cliff, slope, obstruction and jump checks
+  continue to govern actual movement.
+- Rank clear candidates by preferred-range error, then travel distance and fixed
+  candidate order. Require a lane improvement or 0.75 world units of range
+  improvement. Holding a clear effective position remains valid. A transition in
+  existing recent-damage awareness requests reevaluation, without forcing motion.
+- Use explicit hold/approach/retreat/reposition states. Separate retreat entry
+  and exit thresholds; finish approach within navigation's 0.2-unit arrival
+  tolerance. Clear temporary repositioning at a useful position or when the
+  obstruction resolves. Preserve selected destinations through small target
+  shifts, with a one-second replacement interval. Recheck the selected lane and
+  Chief boundary; target/weapon changes invalidate relevant combat state.
+- Use scratch native path results and at most one candidate search per shared
+  15-tick search interval. Commit a successful complete route atomically and
+  reuse it without another search. Failed replacement searches preserve an
+  existing route. Exhausted candidates back off at 1, 2 and then 5 seconds.
+  Refresh candidate ground, clearance and lane after waiting for a search slot.
+- Keep the existing short target-visibility grace; only local last-known-point
+  positions are allowed during it. Expiry cancels combat movement, and firing
+  still requires current visibility. Player movement orders and hold-fire retain
+  priority. No new tactical teleportation or direct-walk fallback is introduced.
+
+### Evidence and runtime diagnosis
+
+The physics harness compiles the actual native `unit_control()`,
+`biped_update_moving()` and `biped_update_physics()` functions, plus the actual
+base-seat switch from `units.c`. Its deterministic floor/blocker collision fixture
+shows world-direction movement while aiming sideways, backwards and diagonally.
+Blocking collision, landing and suspension instead produce zero measured
+movement from nonzero input. An additional regression passes an acquired target's
+actual selected navigation vector into these native routines. Dropping stored
+throttle or selecting the alert seat makes the sideways-motion regression fail.
+This verifies native control/physics behavior in the fixture, not the live map's
+collision geometry, animation assets or hits.
+
+Other regressions cover an effective hold, independent blocked/friendly lane
+repositioning, occlusion grace/expiry, retreat stability, completed/resolved
+repositioning, goal arrival tolerance, selected-lane changes, weapon changes,
+Chief movement, failed replacement atomicity, missing ground and retry budgets.
+Existing corridor, doorway, ramp, ledge, jump, order and firing-safety cases remain.
+
+Measured deterministic costs: a stationary-origin, slowly moving-target fixture
+uses **one path search, four position evaluations and 12 position rays across 60
+ticks**. Unreachable candidate sets use **15 searches, 80 position rays and 275
+ground probes across 600 ticks**, with at least 15 ticks between searches. These
+are fixture query counts, not gameplay timings.
+
+`HALO_DEBUG_COMPANION=1` adds once-per-second position query summaries and
+`Kevin control:` / `Kevin physics:` records. Control reports the decision state,
+nav state/retry, goal distance, world walk, submitted/stored throttle, velocity,
+seat/desired state, physics mode, control/biped flags, parent, measured prior-tick
+displacement and fire rejection reason. The small physics hook in `bipeds.c`
+observes desired local motion and collision-resolved displacement/velocity,
+collision delta, actual seat/animation flags and suspension, without additional
+collision tests. Existing navigation logs distinguish unsafe terrain and route
+rejection. Platform messages go to terminal stderr, not `debug.txt`.
+
+Gameplay still needs to establish whether the reported encounter was an
+intentional hold, failed grounding/position selection, path/retry failure,
+trajectory rejection or zero physical displacement despite stored throttle.
+Use matching control/physics records from the rebuilt executable; nonzero inputs
+alone cannot establish movement or successful shots.
+
+Verification: **540 native harness checks pass** (`pytest tools/harness/tests`),
+and `ninja linux` succeeds with the existing release configuration. The refreshed
+portable patch applies cleanly to a separate pinned `8102e711` checkout; all **49**
+patched files match the working sources byte for byte, preserving all **46**
+previously patched files and their binary assets. Reverse application checks
+against the working checkout and whitespace checks also pass.
