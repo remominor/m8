@@ -447,3 +447,356 @@ portable patch applies cleanly to a separate pinned `8102e711` checkout; all **4
 patched files match the working sources byte for byte, preserving all **46**
 previously patched files and their binary assets. Reverse application checks
 against the working checkout and whitespace checks also pass.
+
+### Review follow-up: candidate coverage and partial combat routes
+
+Both reported gaps were reproduced before the fixes. At exactly six world units
+(the configured preferred distance in the fixture), a blocked lane wider than
+1.2 units left no selected destination. A successfully built nonempty partial
+route was also rejected before movement could start.
+
+`companion_position_candidates()` retains five candidate slots and the existing
+three-unit travel envelope. Its outer pair now uses lateral offsets of 2.4 units
+alongside the range adjustment, while the inner pair stays at 1.2 units. At zero
+range adjustment this produces four distinct lateral destinations, so an
+obstruction that blocks the inner pair can still have a safe outer alternative.
+All existing grounding, range-improvement, clearance, LOS, leash and route checks
+apply. Evaluation and route-search budgets are unchanged.
+
+`companion_combat_goal()` now accepts nonempty partial results from
+`companion_build_path()`, as ordinary navigation already does. The final grounded
+combat destination remains separate from the segment endpoint. Exhausting the
+segment invalidates that segment; normal navigation resumes toward the same
+destination after the shared search interval. A partial result is not proof that
+the final destination can be reached: existing progress checks, recovery limits
+and terrain validation continue to apply.
+
+New regressions exercise perception/selection through movement for the exact
+preferred-distance wide obstruction and partial-route continuation. They check
+one-search route commitment, no early continuation search, preservation of the
+final grounded destination, and immediate refusal after support disappears on an
+accepted partial route. Negative controls reinstate each reported defect and
+must fail its regression. These tests establish controller behavior against a
+synthetic world; physical displacement in campaign terrain remains a gameplay
+check.
+
+Verification: **545 native harness tests pass**, including the new negative
+controls, and the existing Linux release build succeeds (`ninja -C halo linux`).
+The refreshed binary-safe patch applies cleanly to a separate checkout of pinned
+OpenCE `8102e711c353068d22d62efe6bf67ebc8a90a22e`; all **49** patched files match
+the working checkout byte for byte, preserving all previous patched paths and
+binary assets. Reverse application and whitespace checks pass.
+
+## Marine combat adaptation — 2026-10-20
+
+This section supersedes the earlier local-position-only combat policy. The
+baseline is `77e0802` plus the pending candidate-coverage/partial-route fixes.
+Comparison remains pinned OpenCE `8102e711`; Kevin still has no actor datum.
+
+### Established controller problems
+
+- Native `actor_combat_update()` admits a new burst at alignment `0.97` beyond
+  1.5 world units, interpolating from `0.70710677` at zero distance. Its optional
+  start-before-aligned actor flag bypasses this initial alignment delay. Kevin
+  instead required both requested and actual vectors to exceed `0.999` every
+  firing tick. His extra aim smoothing preceded the engine's own aiming update.
+- Native `action_fight_perform()`, `actor_select_firing_position()` and the attack
+  evaluators choose among authored encounter positions using combat-range bands,
+  LOS, travel, crowding and attack vectors. Kevin's five generated offsets and
+  midpoint-based hold did not provide that choice. The native fight selector
+  does not generate Kevin's five-point local fallback.
+- An empty candidate list between tactical evaluations was incorrectly treated
+  as an exhausted search. Successful route commitment clears that list, so
+  ordinary ticks accumulated retry backoff while following a valid route. A
+  600-tick fixture stopped at x=2.85 after one three-unit segment, with no
+  navigation failure, and could not continue approaching. The corrected test
+  reaches x=6.82 (within effective range) using three route searches and 91
+  moving ticks. Restoring the faulty accounting fails this regression.
+
+These are code/fixture findings. They do not prove which gate dominated a
+particular live encounter or that the real biped moved or hit an enemy there.
+
+### Firing and target selection
+
+`companion_fire_requested()` now uses explicit waiting, bursting and pausing
+states. Native distance-dependent alignment applies to burst entry; fresh
+visibility, range, readiness and shot-safety checks apply throughout. Reload,
+heat, invalid solutions, hold-fire and unsafe shots cancel or prevent firing.
+Moving/new-target patterns, burst tracking, lead, configured AI trigger rate,
+reaction timing and relevant timing/rate difficulty scales come from the matching
+Marine firing profile or explicit weapon override. Bounded timing ranges use
+midpoints for deterministic behavior. Unsupported weapons still fail closed.
+Weapon damage and native projectile dispersion are unchanged.
+
+Combat desired aim is submitted directly to native unit aiming, which retains
+the Spartan biped's acceleration, speed and animation bounds. Idle/conversation
+look smoothing remains. The obsolete modulo cadence helper and unused aim-error
+constants were removed.
+
+Both actual and intended firing rays still check blocking geometry. The single
+fresh friendly scan now also checks the entire cone between those aim directions,
+including weapon spread and their firing-origin separation. A new regression
+first demonstrated that an ally between two individually clear endpoint cones
+could otherwise be missed by the wider alignment allowance. The sweep adds no
+collision queries or object scans. Nearly opposite/uncertifiable sweeps fail
+closed; safety never depends on merely passing the alignment threshold.
+
+`companion_target_weight()` adapts native ranged-weapon range/knowledge tiers,
+current-target retention and distance preference. Actual firing direction and
+recent damage provide threat evidence; Chief/direct-attacker priorities remain
+companion preferences. Marine full/partial sight-distance calculations are
+compared against the native perception function across 33 angles, with its
+historical overlay names mapped to public tag offsets. Existing body/head LOS
+checks and bounded five-Hz enemy scans remain. The former 75-metre target cap is
+removed; sensing range and weapon firing range remain distinct.
+
+### Authored positions and navigation
+
+- Cache the nearest 16 valid authored positions within the native ground search
+  radius of 15 world units in the current BSP. Include default-team map positions
+  independently of any Marine, plus allied Human encounters, not just Chief's
+  exact Player team. Explicitly hostile encounters are excluded. Player and
+  Human are distinct native teams.
+- Cheap range/travel scoring ranks the shortlist before at most five detailed
+  checks per half-second evaluation. Native-style attack/combat-range, LOS,
+  friendly firing-lane and enemy attack-vector terms guide selection. Reuse the
+  actual actor-free `actor_perception_aiming_vector_test_blockage()` primitive.
+- Read live friendly actor position claims and body clearance without claiming,
+  moving or creating actors. Recheck pending candidate availability when the
+  shared path-search budget becomes available. All grounding, standing clearance,
+  partial-route continuation and existing movement trajectory checks remain.
+- Exhaust authored batches/routes before using the bounded generated local
+  fallback. Local fallback is a companion adaptation for absent/unusable authored
+  data, not a native Marine feature. It can also get out of Chief's firing lane.
+- Preserve useful selected goals through small target movement and native-profile
+  residence times; do not rebuild the same destination when residence expires.
+  BSP changes invalidate old routes/cache before movement and cannot repeatedly
+  reset ordinary following after combat ends. Retry accounting runs for actual
+  evaluated/attempted candidate work, rather than every simulation tick.
+- Remove Chief's leash from combat goals and movement. Stay and go-to still
+  override tactical movement; go-to permits defensive fire, and hold-fire disables
+  firing/pursuit. Ordinary following resumes after combat. Catch-up teleportation
+  is suppressed during active combat and on the first tick of a new target.
+
+No corridor, doorway, slope, cliff, wall, jump or collision thresholds were
+relaxed. No new actor integration, tactical framework, conversation, network or
+model-service changes were introduced. The existing LAN interface is untouched.
+
+### Diagnostics, evidence and limits
+
+Optional once-per-second diagnostics report actual/requested alignment, native
+threshold, burst state, distinct rejection counts, authored/local goal source,
+position score, cache/context scan counts, requested movement and measured native
+displacement. A diagnostic observer in native `trigger_create_projectiles()`
+counts successfully created companion-owned projectiles; requests, emitted
+projectiles and hits are different quantities. The observer does not change
+weapon mechanics or authorize a shot.
+
+Deterministic measurements:
+
+| Fixture | Result |
+| --- | --- |
+| Native angular-acceleration tracking, 120 ticks | 72 safe trigger requests; only 27 of those meet the old `0.999` alignment; 12 alignment waits |
+| Local approach, 600 ticks | 91 moving ticks, three route searches, x=6.82; no overshoot or invented candidate failures |
+| Unreachable positions, 600 ticks | 15 route searches with interval/backoff enforcement, 80 position rays, 275 ground probes; no direct movement |
+| Combat, 90 ticks | 15 enemy scans, one profile scan, 54 safe fire requests |
+| Same fixture with six-tick ally crossing | Six immediate safety rejections; firing resumes without target jitter |
+| Authored shortlist | At most 16 cached points and five detailed candidates per evaluation; blocked lanes avoid route searches |
+
+The harness uses native aiming acceleration, weapon/projectile aiming math,
+friendly-lane geometry, unit controls and biped physics where applicable. The
+acquisition-to-authored-position result also feeds the real native control/physics
+fixture and must produce measured displacement. Fixtures do not reproduce live
+animation assets, squad knowledge, encounter scripting or campaign collision
+geometry completely. Kevin does not acquire Marine encounter/squad assignments,
+scripted firing-position group permissions, shared prop knowledge or the full
+emotional/action controller. Those are deliberate limits of the selected
+actor-free approach, rather than claims of exact NPC parity.
+
+Next gameplay validation: compare Kevin and nearby Marines in the same encounter
+with `HALO_DEBUG_COMPANION=1`, checking emitted projectiles, actual aim lag,
+authored-position availability, measured displacement, friendly crossings and
+return to following. A stationary but effective firing position remains valid.
+
+Final verification: **582 native harness checks pass**
+(`python -m pytest -q halo/tools/harness/tests`), including negative controls for
+alignment, burst continuation, aiming-sweep safety, authored priority and the
+between-evaluation retry defect. The existing Linux release build succeeds
+(`ninja -C halo linux`). The regenerated binary-safe patch applies cleanly to a
+separate pinned `8102e711` checkout; all **50** resulting files match the working
+checkout byte for byte, retaining the original **49** patched paths and their
+binary assets plus the native projectile observer. Reverse application and
+whitespace checks pass. No live game was launched or restarted for validation.
+
+### Live follow-up: default encounter allegiance
+
+The captured a10 session showed mostly settled actual aim, 49 fire requests and
+49 observed projectile spawns, but no authored position selections. Nonzero
+navigation requests did produce displacement; the stationary intervals had zero
+requested movement. This establishes a position-selection problem in that session,
+not a demonstrated failure of the biped controls. Shot safety also rejected 304
+opportunities; those rejections remain conservative.
+
+Inspection of the loaded a10 cache found all 39 encounter definitions use the
+`default` team, including encounters supplying friendly Marines. The former
+allied-team tag filter therefore discarded every encounter. Encounter tag team
+is not sufficient to infer the allegiance of its live actors.
+
+Kevin now evaluates nearby default-team authored positions directly, with no
+living, dead, or previously encountered Marine needed. Authored points are map
+geometry, not orders borrowed from an actor. The short-lived association-based
+fix was too restrictive and has been removed, along with its extra unit scan and
+64-encounter association cap. Explicit hostile encounter restrictions still apply;
+neutral/default points are not owned by a hostile actor merely because it uses
+the same encounter. Like native encounter activation, an unspecified BSP reference
+is accepted, while a different explicit BSP is rejected.
+
+The existing 16-point shortlist, five detailed candidates per evaluation, shared
+path-search budget and local fallback remain unchanged. Per-position walkable
+surfaces, grounding, occupancy, Marine claims, friendly lanes, path checks and
+trajectory safety remain in force. Kevin neither acquires an actor nor modifies
+Marine claims or squad state. Squad-specific firing-position group permissions
+remain outside this actor-free adaptation; each point is evaluated for Kevin's
+current target and physical navigation instead.
+
+Debug output reports nearby cached positions on cache refresh, plus ground,
+occupancy, lane and score rejection counters in the existing one-second combat
+summary. These distinguish unavailable authored points from unsafe candidate
+terrain without extra collision probes. The separately observed `no structure
+hit under footprint` rejection is not bypassed by this fix.
+
+Regressions cover default-team selection with no Marine present, unspecified BSPs,
+continued availability after Marine death, independence of hostile actor
+associations, rejection of explicitly hostile encounters and different explicit
+BSPs, unsafe ground, failed routes and bounded retries. The no-Marine case passes
+through target acquisition and safe routing into the native control/physics
+displacement fixture. A negative control restoring default-team rejection must
+fail the case. Live campaign geometry and the improvement in gameplay still
+require a new game process using the rebuilt executable.
+
+Independent-selection verification: **591 native harness tests pass**, including
+no-Marine acquisition-to-native-physics displacement and the negative control.
+The Linux release build succeeds. The regenerated binary-safe patch applies to a
+separate clean pinned `8102e711` checkout; all 50 resulting files match the working
+checkout byte for byte. Reverse application and whitespace checks pass. No game
+process was launched or restarted for validation.
+
+## Bounded co-op purposes and observed threat memory — 2026-10-22
+
+This pass builds on the local navigation/combat fixes above. It does not add full
+actor AI or require a living Marine. Persistent orders remain independent of a
+small temporary-purpose state: engage, reposition, recover, investigate, regroup.
+
+### Behavior changes
+
+- **Observation:** `companion_observe`, `companion_insert_enemy` and
+  `companion_look_around` retain at most twelve timestamped visual observations.
+  Only a successful LOS sample updates a position. Occluded entries use the last
+  observed position and Kevin's position at that observation; live hidden enemy
+  coordinates cannot update their movement destination. Entries expire after
+  three seconds, and visible contacts take priority over nearer remembered ones.
+  Death/team validation may invalidate memory, but cannot refresh its coordinates.
+- **Investigation:** a hidden selected target permits a grounded route toward its
+  frozen observation for at most three seconds. The endpoint is within five world
+  units of Kevin's observation-time position. Measured travel is also bounded
+  (stop request at 4.8 units, reserving 0.2 for stopping); movement does not renew
+  the investigation envelope. Fresh visibility and shot checks remain mandatory
+  for firing. Nearby visible enemies supersede unusable remembered targets.
+- **Recovery:** `companion_tactical_goal` enters at shields <=25% with a known
+  target, and leaves at >=65% or threat expiry. `companion_exposure` tests at most
+  three existing observations. Five local grounded candidates are ranked by lower
+  exposure, then shorter travel. Concealment does not require a firing lane.
+  Candidates still need walkable ground, clearance, a native route and all normal
+  trajectory checks. No available safer position means defensive holding, with
+  safe firing still permitted; it does not cause blind retreat or teleporting.
+- **Engagement:** retain effective firing positions. Incoming damage can request
+  an exposure-improving position on the next two-Hz evaluation. Existing friendly
+  lane, occupancy, weapon-distance and authored-position scoring remain. A valid
+  selected move is committed for at least one second unless movement safety
+  rejects it, its purpose changes, or a changed weapon invalidates its range.
+  Target changes alone preserve route and progress. Safety and per-shot friendly
+  checks continue every tick, independent of commitment.
+- **Regroup:** while following, separation greater than 20 metres and increasing
+  for one second activates regroup. It remains active until within 12 metres.
+  Kevin uses the ordinary follow route and can defend while returning. This is a
+  preference, not a hard combat leash. Shield recovery takes priority over regroup.
+- **Orders:** stay and go-to retain movement priority. Hold-fire prevents firing
+  and autonomous combat movement, while ordinary following remains available.
+  Tactical state never rewrites an order. No new model calls or socket messages.
+- **Firing:** native weapon math, projectile leading, burst timing, reload and
+  alignment rules are unchanged. Rejections now distinguish invalid observation,
+  missing firing origin, unsafe aim sweep, obstructing geometry/object, and
+  friendly cones. Alignment/origin failures do not accumulate blocked-target
+  cooldown. Tactical lane evaluation remains independent of trigger success.
+
+### Source references and adaptation boundaries
+
+- OpenCE `8102e711`: `elite_decide_action` (`actor_type_elite.c:78–107`) and
+  `actor_action_handle_active_cover_seeking` (`actions.c:1777`) motivate separate
+  shield entry/exit thresholds. Kevin reads his own vitality directly; no actor
+  defensive state or damage modifiers are imported.
+- `actor_firing_position.c` supplies the range/LOS/context evaluation pattern;
+  `actor_moving.c:2103` supplies stable route advancement and obstruction handling.
+  Attack and concealment are evaluated for different purposes.
+- [Quake III, ai_dmq3.c](https://github.com/id-Software/Quake-III-Arena/blob/master/code/game/ai_dmq3.c):
+  committed movement and bounded last-seen pursuit inform the independent local
+  implementation; random dodging and arena traversal were not copied.
+- [ReGameDLL_CS attack state](https://github.com/rehlds/ReGameDLL_CS/blob/master/regamedll/dlls/bot/states/cs_bot_attack.cpp):
+  exposure and combat circumstances inform purposeful repositioning.
+- [Xonotic Havocbot](https://gitlab.com/xonotic/xonotic-data.pk3dir/-/blob/master/qcsrc/server/bot/default/havocbot/havocbot.qc)
+  and [Red Eclipse AI](https://github.com/redeclipse/base/blob/master/src/game/ai.cpp):
+  progress-aware failure memory informs the bounded unsuccessful-destination cache.
+- [Left4Bots](https://github.com/smilz0/Left4Bots/blob/main/root/scripts/vscripts/left4bots_ai.nut):
+  measured movement and companion-follow coordination inform the separation of
+  requested motion, observed displacement and regrouping. No foreign library,
+  physics, navigation data, random strafing or teleport recovery was imported.
+
+### Regression and measurement evidence
+
+Tests cover frozen hidden coordinates (including a negative control that restores
+live coordinates), expiry, a full memory list, target switching during movement,
+shield hysteresis, cover without a firing lane, no safe cover, missing support,
+regroup hysteresis, all movement/fire order combinations, investigation duration
+and distance, shared search budgets, and distinct shot rejection reasons. Negative
+controls also undo recovery hysteresis, regrouping and failed-destination memory.
+Existing native aim/projectile, friendly crossing, burst, reload, side/backwards
+movement, route safety and emitted-projectile observer tests remain.
+
+For the same 90-tick combat fixture, baseline and current are identical: 90 target
+choices, 15 global scans, 135 visibility probes, 90 aim solutions, 54 accepted fire
+requests; inserting a friendly produces six blocked requests and still 54 accepted
+requests. Ground-query reduction is documented in `NAVIGATION_REVIEW.md`.
+Accepted requests are not measured hits or live emitted projectiles. The existing
+projectile-emission callback regression verifies reporting, not combat effectiveness.
+
+A new Pillar of Autumn run is still needed to establish actual advancement,
+concealment quality, stopping distance during investigation, doorway recovery,
+emitted projectiles and hits. Local recovery examines only five positions and can
+miss better cover farther away. Observations expire quickly by design. No grenade,
+vehicle, scavenging, melee expansion or squad-state integration is included.
+
+Final verification: **633 native harness tests passed**, Linux release build
+succeeded, and all **52 patched files** were verified byte for byte after applying
+the regenerated patch to a separate clean pinned `8102e711` checkout. No live
+movement or hit-rate improvement is claimed from these results.
+
+## Review corrections — 2026-10-22
+
+`companion_combat_goal` now consults failed-destination memory before retaining a
+selected local position, including during its initial commitment. Previously a
+clear predicted firing lane could retain an unusable position indefinitely even
+with an invalid route. Regressions verify that a different candidate is evaluated,
+receives a validated route and produces movement after exhausted recovery.
+
+Weapon changes reject a selected position inside the new minimum-distance margin
+while preserving compatible routes and their progress history. A regression raises
+the weapon minimum range and verifies that retreat cannot keep the old forward
+approach; another verifies that a compatible swap does not trigger another search.
+Investigation retries retain their remembered destination instead of inheriting
+the ordinary follow fallback to Chief. Orders and per-shot safety remain intact.
+
+Validation: **655 native harness tests passed**, including negative controls for
+all four reported defects and the native escape physics feedback described in
+`NAVIGATION_REVIEW.md`. The Linux release build succeeded, and the refreshed patch
+was applied to clean pinned `8102e711` with all **52 files** matching the working
+checkout. These results establish controller behavior, not live movement or hits.

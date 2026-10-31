@@ -11,6 +11,13 @@ Clef interprets the current utterance using one focused intent choice; it has no
 guard. The question asks for `none` on conversation, quoted/hypothetical instructions, unsupported
 requests and ambiguous or conflicting orders. These are examples, not an approved phrase list:
 
+Use `kevin teleport` or `kevin respawn` in the game developer console to immediately replace
+Kevin beside Chief. This native command works without Clef or an m8 connection; it restores the
+default Follow and fire-enabled orders. It is available in campaign, not multiplayer. Placement uses Kevin's
+standing body dimensions, verified floor support, BSP continuity and collision clearance.
+If placement or object creation fails, the current Kevin and his orders are preserved;
+the console distinguishes placement failures from engine object-creation failures.
+
 | Intent | Examples | Effect |
 | --- | --- | --- |
 | `none` | Ordinary conversation; “maybe go somewhere” | Preserve both orders |
