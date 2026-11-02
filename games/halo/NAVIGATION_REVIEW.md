@@ -499,3 +499,48 @@ regressions, negative controls and native control/physics check. The Linux
 release build succeeded. The binary-safe patch applies and reverse-checks on
 clean pinned `8102e711`; all **54 files** match the working checkout. No running
 game was restarted, and no live traversal is claimed from these fixtures.
+
+## Passenger and gunner integration — 2026-11-01
+
+`companion_vehicle_update` now runs before perception and control. Follow targets
+Chief's current vehicle only. `companion_vehicle_seat` ranks compatible, vacant
+non-driver seats, preferring gunner over passenger. It verifies native seat markers,
+entry animations and vacancy without actor state or eviction. Seat selection stays
+stable during approach; mounted occupants never change seats opportunistically.
+
+References against pinned OpenCE `8102e711`: `source/ai/action_vehicle.c`,
+`action_vehicle_desirable` and `action_vehicle_evaluate_seat` (upright/stopped
+checks, entrance, distance/facing gates); `source/units/units.c`,
+`unit_has_animation_to_enter_seat`, `unit_can_enter_seat`, `unit_is_busy`,
+`unit_get_seat_entrance_point`, `unit_enter_seat` and `unit_try_and_exit_seat`.
+The actor-bound vehicle action itself is not used.
+
+Entrance goals are ground-projected with full standing clearance and sent through
+the existing bounded route/corridor/obstacle/cliff controller. Approach selects its
+own pace rather than inheriting a previous tactical pace. Entry requires native
+range/facing gates, a clear approach, grounded feet and an interruptible animation.
+There is no timed fake entry. Five navigation failures or forty seconds without
+measured progress abandon an approach for five seconds; native path searches retain
+the shared budget. Seat and ground evaluation runs at 2 Hz. No available seat means
+waiting rather than routing toward Chief inside the hull. Catch-up teleportation
+is disabled while Chief is aboard.
+
+Voluntary exit requires an upright, stopped vehicle close to supporting structure,
+walkable nearby ground, full-footprint support and standing clearance. A dry-run
+`biped_fix_position(..., dont_teleport=TRUE)` validates local placement without
+moving Kevin. The same checks run again at exit-animation completion. If terrain
+or speed changes, native seated idle resumes and exit waits. A verified exit uses
+that local position instead of `biped_exit_seat_end`'s relocation fallback and
+suppresses the exit impulse. Forced scripted/death removals bypass this voluntary
+animation gate. No new ordinary-recovery teleport is introduced.
+
+Stay and go-to override riding and wait for a safe dismount. Stay holds the actual
+landing position. Go-to validates its captured ground and a route from a verified
+exit before acceptance; a delayed stay cannot overwrite that destination. Hold-fire
+allows riding and continues to suppress personal and mounted firing. No socket,
+conversation, model, LAN, game-data or voice configuration changes were made.
+
+**731 native harness tests passed**, and the Linux release build and link check
+passed. All **57 patch files** apply to clean pinned OpenCE and match the working
+checkout. Validation details and live-test limits are recorded in
+[VEHICLES.md](VEHICLES.md).

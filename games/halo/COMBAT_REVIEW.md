@@ -800,3 +800,30 @@ all four reported defects and the native escape physics feedback described in
 `NAVIGATION_REVIEW.md`. The Linux release build succeeded, and the refreshed patch
 was applied to clean pinned `8102e711` with all **52 files** matching the working
 checkout. These results establish controller behavior, not live movement or hits.
+
+
+## Vehicle weapon context — 2026-11-01
+
+`companion_weapon_owner` distinguishes a personal weapon from a vehicle weapon
+owned by Kevin's native gunner seat. The profile cache includes both weapon and
+owner, so boarding and dismounting invalidate it even if inventory indices match.
+Passengers retain personal inventory and native animation/weapon compatibility.
+
+The reference is `source/units/units.c`'s gunner-control forwarding and
+`source/items/weapons.c::trigger_create_projectiles`: the vehicle owns the weapon,
+and a gunner uses actual trigger-marker forward vectors. Kevin submits controls
+only to his own biped; seated throttle is zero, and no driving/action/grenade/swap
+controls are submitted. Entry and exit suppress all actions.
+
+Direct-fire mounted weapons use the existing native aim, lead, burst, readiness,
+reload and heat handling. Origin-trigger weapons are allowed only in mounted
+context; explosive, charged and ballistic unsupported types remain disabled.
+Actual turret-muzzle alignment replaces the biped aiming vector for mounted fire.
+Every active primary muzzle (up to eight; larger sets fail closed) receives fresh
+intended/actual ray, spread and aim-sweep friendly checks. The owning hull is not
+mistaken for a friendly biped sphere; Chief and all occupants remain protected.
+Seated perception uses the biped head, since native camera fallback can lie inside
+the hull. Successful vehicle projectile creation contributes to the existing
+emitted-projectile diagnostic, which does not establish hits.
+
+See [VEHICLES.md](VEHICLES.md) for validation and gameplay scenarios still required.

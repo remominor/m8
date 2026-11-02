@@ -1761,10 +1761,10 @@ index def58c7fbe4393450aaf5408ea57484347bdd493..f0bfa6566835845347c96ff26d251eba
  | `debug.menu_open` | `""` | `HALO_MENU_OPEN` | Start on this screen of the menus (`main_menu/settings_select/...`, as `port/assets/menus` names it), a player profile being edited, to look at it. |
 diff --git a/port/linux/game/companion.c b/port/linux/game/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5788c654a
+index 0000000000000000000000000000000000000000..b265116799688669acb19c8df40787537ea7fc95
 --- /dev/null
 +++ b/port/linux/game/companion.c
-@@ -0,0 +1,6293 @@
+@@ -0,0 +1,6688 @@
 +/*
 +COMPANION.C
 +
@@ -2066,7 +2066,9 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	boolean origin_missing;
 +	boolean start_unaligned;
 +	boolean pulsed;
-+	long weapon_index;
++	long weapon_index, owner_index;
++	boolean mounted, all_origins;
++	short muzzle_index;
 +	real range, minimum, vision, peripheral, central_cosine, peripheral_cosine;
 +	real combat_range_lower, combat_range_upper;
 +	real central_angle, transition_angle;
@@ -2121,6 +2123,14 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	short failed_bsp[8];
 +	real_point3d failed_origin[8], failed_destination[8];
 +
++	/* Temporary riding purpose; never changes persistent player orders. */
++	long ride_vehicle, ride_retry, ride_check, ride_progress_time;
++	short ride_seat;
++	boolean ride_goal_valid, ride_exit_pending, ride_exit_approved, ride_hold_after_exit, ride_waiting;
++	long ride_log_time;
++	char const *ride_reason;
++	real_point3d ride_goal, ride_progress, ride_exit_point;
++	real_vector3d ride_facing;
 +	struct companion_combat_profile combat;
 +	struct companion_combat_metrics combat_metrics;
 +	long enemy_scan_time;
@@ -2300,6 +2310,9 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	real_point3d ground;
 +};
 +static struct companion_command_context companion_contexts[32];
++static boolean companion_ground_sample(long unit_index, real_point3d const *point, real above, real below, real_point3d *ground, long *surface);
++static boolean companion_walkable_surface(long surface);
++static boolean companion_vehicle_exit_point(long unit_index, real_point3d *point);
 +static boolean companion_ground(long unit_index, real_point3d const *point, real above, real below, real_point3d *ground);
 +static void companion_navigation_note(char const *reason);
 +static long companion_navigation_start(long unit_index, real_point3d *ground);
@@ -2428,6 +2441,8 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +static void companion_reset_body(long unit_index)
 +{
 +	csmemset(&companion_body, 0, sizeof(companion_body));
++	companion_body.ride_vehicle = NONE;
++	companion_body.ride_seat = NONE;
 +	companion_body.order = _companion_order_follow;
 +	companion_body.target_unit_index = NONE;
 +	companion_body.combat_target_index = NONE;
@@ -2498,7 +2513,8 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +
 +	if (companion_body.order != _companion_order_follow || companion_body.combat_engaging ||
 +		(!companion_body.hold_fire && companion_body.target_unit_index != NONE) ||
-+		unit_get(unit_index)->object.parent_object_index != NONE)
++		unit_get(unit_index)->object.parent_object_index != NONE ||
++		unit_get(player_unit_index)->object.parent_object_index != NONE)
 +		return;
 +	object_get_origin(unit_index, &origin);
 +	object_get_origin(player_unit_index, &player_origin);
@@ -2589,6 +2605,18 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	return unit && !TEST_FLAG(unit->object.damage_flags, _object_dead_bit);
 +}
 +
++/* Native vehicle updates propagate a gunner's aim/trigger to its own weapon.
++Passengers retain their own inventory. Never submit driving controls. */
++static long companion_weapon_owner(long unit_index)
++{
++	struct unit_datum *unit = unit_get(unit_index);
++	long parent = unit->object.parent_object_index;
++	struct unit_datum *vehicle = parent == NONE ? NULL : unit_try_and_get(parent);
++
++	return vehicle && vehicle->object.type == _object_type_vehicle &&
++		vehicle->unit.gunner_object_index == unit_index ? parent : unit_index;
++}
++
 +static void companion_update_combat_profile(long unit_index);
 +static boolean companion_refresh_enemy(long unit_index, struct companion_enemy *enemy);
 +static boolean companion_enemy_in_view(long unit_index, struct companion_enemy const *enemy);
@@ -2653,7 +2681,9 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	if (game_time_get() < companion_body.enemy_scan_time) return;
 +	companion_body.enemy_scan_time = game_time_get() + MAX(1, TICKS_PER_SECOND / 5);
 +	companion_body.combat_metrics.scans++;
-+	unit_get_camera_position(unit_index, &eye);
++	if (unit_get(unit_index)->object.parent_object_index != NONE)
++		unit_get_head_position(unit_index, &eye); /* native camera can be inside the vehicle hull */
++	else unit_get_camera_position(unit_index, &eye);
 +	object_get_origin(unit_index, &origin);
 +	companion_enemy_count = 0;
 +	object_iterator_new(&iterator, _object_mask_unit, 0);
@@ -2794,20 +2824,23 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +{
 +	struct companion_combat_profile *profile = &companion_body.combat;
 +	struct unit_datum *unit = unit_get(unit_index);
-+	long weapon_index = unit_inventory_get_weapon(unit_index, unit->unit.current_weapon_index);
++	long owner = companion_weapon_owner(unit_index);
++	long weapon_index = unit_inventory_get_weapon(owner, unit_get(owner)->unit.current_weapon_index);
 +	struct weapon_definition *weapon = weapon_index != NONE ? weapon_definition_get(weapon_get(weapon_index)->definition_index) : NULL;
 +	struct actor_variant_definition *firing = NULL;
 +	struct actor_definition *marine = NULL;
 +	struct tag_iterator iterator;
 +	long tag;
 +
-+	if (profile->initialized && profile->weapon_index == weapon_index)
++	if (profile->initialized && profile->weapon_index == weapon_index && profile->owner_index == owner)
 +		return;
 +	csmemset(profile, 0, sizeof(*profile));
 +	profile->initialized = TRUE;
 +	companion_body.target_blocked_since = 0;
 +	companion_body.target_blocked_index = NONE;
 +	profile->weapon_index = weapon_index;
++	profile->owner_index = owner;
++	profile->mounted = owner != unit_index;
 +	profile->vision = 25.f;
 +	profile->peripheral = 10.f;
 +	profile->central_angle = 1.04719755f;
@@ -2887,8 +2920,10 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		struct weapon_trigger_definition *trigger = TAG_BLOCK_GET_ELEMENT(&weapon->weapon.triggers, 0, struct weapon_trigger_definition);
 +		struct projectile_definition *projectile;
 +
-+		if (trigger->projectile.index == NONE || trigger->charging_time > 0.f ||
-+			(trigger->flags & (FLAG(_weapon_trigger_toggles_bit) | FLAG(_weapon_trigger_uses_weapon_origin_bit) |
++		profile->all_origins = TEST_FLAG(trigger->flags, _weapon_trigger_uses_weapon_origin_bit);
++		if ((!profile->mounted && profile->all_origins) ||
++			trigger->projectile.index == NONE || trigger->charging_time > 0.f ||
++			(trigger->flags & (FLAG(_weapon_trigger_toggles_bit) |
 +			FLAG(_weapon_trigger_projectiles_cannot_be_aimed_bit))))
 +			return;
 +		projectile = projectile_definition_get(trigger->projectile.index);
@@ -2910,7 +2945,7 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +			real useful = projectile->projectile.air_damage_range_upper_bound;
 +
 +			if (!(useful > 0.f)) useful = projectile->projectile.maximum_range;
-+			profile->range = useful > 0.f ? MIN(useful, 12.f) : 12.f;
++			profile->range = useful > 0.f ? MIN(useful, profile->mounted ? profile->vision : 12.f) : 12.f;
 +		}
 +		if (!(profile->range > 0.f)) profile->range = projectile->projectile.maximum_range;
 +		if (projectile->projectile.maximum_range > 0.f)
@@ -2993,7 +3028,8 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		companion_body.combat_metrics.visibility++;
 +		if (!collision_test_line(FLAG(_collision_test_structure_bit) | FLAG(_collision_test_front_facing_surfaces_bit) |
 +			FLAG(_collision_test_back_facing_surfaces_bit) | FLAG(_collision_test_objects_bit) |
-+			_collision_test_objects_sight_blocking_flags, &eye, &point, unit_index, &collision) ||
++			_collision_test_objects_sight_blocking_flags, &eye, &point,
++			companion_body.combat.mounted ? companion_body.combat.owner_index : unit_index, &collision) ||
 +			(collision.type == _collision_result_object && collision.object_index == enemy->unit_index))
 +		{
 +			enemy->aim_point = point;
@@ -3050,20 +3086,35 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +
 +/* Follow trigger_create_projectiles for Kevin's actor-less third-person gun.
 +Fail closed when no marker exists. Do not guess a firing origin from his eye. */
++/* Bound support to eight active muzzles. A ninth refuses the weapon rather
++than silently leaving some native projectile origins unchecked. */
++static short companion_muzzle(long weapon_index, short index, struct object_marker *marker)
++{
++	struct weapon_datum *weapon = weapon_get(weapon_index);
++	long effect = TEST_FLAG(weapon->object.flags, _object_invisible_bit) && weapon->object.parent_object_index != NONE ?
++		weapon->object.parent_object_index : weapon_index;
++	struct object_marker markers[9];
++	short count = object_get_marker_by_name(effect, "primary trigger", markers, 9);
++
++	if (count <= 0 || count > 8 || index >= count) return 0;
++	*marker = markers[index];
++	return companion_body.combat.all_origins ? count : 1;
++}
++
 +static boolean companion_firing_origin(long unit_index, long weapon_index, real_vector3d const *aim, real_point3d *origin)
 +{
 +	struct object_marker marker;
 +	struct weapon_datum *weapon = weapon_get(weapon_index);
-+	struct unit_definition *definition = unit_definition_get(unit_get(unit_index)->definition_index);
++	struct unit_definition *definition = unit_definition_get(unit_get(companion_weapon_owner(unit_index))->definition_index);
 +	long effect = TEST_FLAG(weapon->object.flags, _object_invisible_bit) && weapon->object.parent_object_index != NONE ?
 +		weapon->object.parent_object_index : weapon_index;
 +	real_vector3d direction = *aim;
 +	real velocity;
 +
-+	if (!object_get_marker_by_name(effect, "primary trigger", &marker, 1))
++	if (!companion_muzzle(weapon_index, companion_body.combat.muzzle_index, &marker))
 +	{
 +		if (!companion_body.combat.origin_missing)
-+			platform_log("Kevin combat: missing primary trigger marker weapon=%08lx definition=%08lx effect=%08lx; firing suspended",
++			platform_log("Kevin combat: missing primary trigger marker (or unsupported muzzle count) weapon=%08lx definition=%08lx effect=%08lx; firing suspended",
 +				weapon_index, weapon->definition_index, effect);
 +		companion_body.combat.origin_missing = TRUE;
 +		return FALSE;
@@ -3072,9 +3123,27 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		platform_log("Kevin combat: primary trigger marker restored weapon=%08lx; firing available", weapon_index);
 +	companion_body.combat.origin_missing = FALSE;
 +	*origin = marker.matrix.position;
-+	unit_adjust_projectile_ray(unit_index, origin, &direction, &velocity,
-+		TEST_FLAG(definition->unit.flags, _unit_fires_from_camera_bit), FALSE);
++	if (!companion_body.combat.all_origins)
++		unit_adjust_projectile_ray(companion_weapon_owner(unit_index), origin, &direction, &velocity,
++			TEST_FLAG(definition->unit.flags, _unit_fires_from_camera_bit), FALSE);
 +	return TRUE;
++}
++
++static boolean companion_actual_aim(long unit_index, real_vector3d *aim)
++{
++	long owner = companion_weapon_owner(unit_index);
++	struct object_marker marker;
++	long weapon = companion_body.combat.weapon_index;
++
++	if (owner == unit_index)
++	{
++		unit_get_aiming_vector(unit_index, aim);
++		return normalize3d(aim) > 0.99f;
++	}
++	if (weapon == NONE) return FALSE;
++	if (!companion_muzzle(weapon, companion_body.combat.muzzle_index, &marker)) return FALSE;
++	*aim = marker.matrix.forward;
++	return normalize3d(aim) > 0.99f;
 +}
 +
 +static boolean companion_aim_solution(long unit_index, struct companion_enemy const *enemy, struct companion_shot *shot)
@@ -3162,7 +3231,7 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	return TRUE;
 +}
 +
-+static boolean companion_safe_shot(long unit_index, struct companion_enemy const *enemy, struct companion_shot const *shot)
++static boolean companion_safe_shot_ray(long unit_index, struct companion_enemy const *enemy, struct companion_shot const *shot)
 +{
 +	struct object_iterator iterator;
 +	struct unit_datum *other;
@@ -3179,8 +3248,7 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		return FALSE;
 +	companion_body.shot_rejection = _companion_shot_origin;
 +	companion_body.fire_reason = "firing origin or direction unavailable";
-+	unit_get_aiming_vector(unit_index, &actual);
-+	if (!(normalize3d(&actual) > 0.99f) ||
++	if (!companion_actual_aim(unit_index, &actual) ||
 +		!companion_firing_origin(unit_index, profile->weapon_index, &actual, &actual_origin)) return FALSE;
 +	for (ray = 0; ray < 2; ray++)
 +	{
@@ -3193,7 +3261,7 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		companion_body.combat_metrics.rays++;
 +		if (collision_test_line(FLAG(_collision_test_structure_bit) | FLAG(_collision_test_front_facing_surfaces_bit) |
 +			FLAG(_collision_test_back_facing_surfaces_bit) | FLAG(_collision_test_objects_bit) | _collision_test_objects_all_types_flags,
-+			origin, &end, unit_index, &collision) &&
++			origin, &end, companion_weapon_owner(unit_index), &collision) &&
 +			(collision.type != _collision_result_object || collision.object_index != enemy->unit_index))
 +		{
 +			companion_body.shot_rejection = _companion_shot_geometry;
@@ -3223,7 +3291,7 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	object_iterator_new(&iterator, _object_mask_unit, 0);
 +	while ((other = (struct unit_datum *)object_iterator_next(&iterator)) != NULL)
 +	{
-+		if (iterator.index == unit_index || iterator.index == enemy->unit_index ||
++		if (iterator.index == unit_index || iterator.index == unit_get(unit_index)->object.parent_object_index || iterator.index == enemy->unit_index ||
 +			TEST_FLAG(other->object.damage_flags, _object_dead_bit) ||
 +			companion_enemy_team(unit_get(unit_index)->object.owner_team_index, other->object.owner_team_index)) continue;
 +		if (companion_friendly_cone(&shot->origin, &shot->aim, shot->distance,
@@ -3235,6 +3303,31 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +			sweep_spread)) return FALSE;
 +	}
 +	return TRUE;
++}
++
++static boolean companion_safe_shot(long unit_index, struct companion_enemy const *enemy, struct companion_shot const *shot)
++{
++	struct companion_combat_profile *profile = &companion_body.combat;
++	struct object_marker marker;
++	struct companion_shot muzzle_shot = *shot;
++	short count, index;
++	boolean safe = TRUE;
++
++	if (!profile->mounted) return companion_safe_shot_ray(unit_index, enemy, shot);
++	count = companion_muzzle(profile->weapon_index, 0, &marker);
++	if (!count) return FALSE;
++	for (index = 0; index < count; index++)
++	{
++		profile->muzzle_index = index;
++		if (!companion_firing_origin(unit_index, profile->weapon_index, &shot->aim, &muzzle_shot.origin) ||
++			!companion_safe_shot_ray(unit_index, enemy, &muzzle_shot))
++		{
++			safe = FALSE;
++			break;
++		}
++	}
++	profile->muzzle_index = 0;
++	return safe;
 +}
 +
 +/* Acquisition and pursuit use the Marine perception radius; weapon range and
@@ -3471,8 +3564,7 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		companion_body.combat_metrics.readiness_waits++;
 +		return FALSE;
 +	}
-+	unit_get_aiming_vector(unit_index, &actual);
-+	if (normalize3d(&actual) < 0.99f) return FALSE;
++	if (!companion_actual_aim(unit_index, &actual)) return FALSE;
 +	companion_body.requested_alignment = dot_product3d(&companion_body.aim, &shot->aim);
 +	companion_body.actual_alignment = dot_product3d(&actual, &shot->aim);
 +	companion_body.alignment_threshold = shot->distance < 1.5f ?
@@ -3749,34 +3841,56 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	return TRUE;
 +}
 +
-+/* the way into a vehicle: the entrance of the nearest seat he can take now
-+(the game's own, unit_get_seat_entrance_point); FALSE if none is free */
-+static boolean companion_seat_entrance(
-+	long unit_index,
-+	long vehicle_index,
-+	real_point3d *entrance)
++/* Native seat metadata and compatibility, without an actor or eviction.
++Gunner seats take priority; equal roles use distance then stable tag order. */
++static boolean companion_vehicle_seat(long unit_index, long vehicle_index,
++	short *selected, real_point3d *entrance)
 +{
-+	struct unit_definition *definition = unit_definition_get(unit_get(vehicle_index)->definition_index);
++	struct unit_datum *vehicle = unit_try_and_get(vehicle_index);
++	struct unit_definition *definition;
 +	real_point3d origin;
 +	real best = REAL_MAX;
-+	short seat_index;
++	boolean best_gunner = FALSE;
++	short index;
 +
++	*selected = NONE;
++	if (!vehicle || vehicle->object.type != _object_type_vehicle ||
++		TEST_FLAG(vehicle->object.damage_flags, _object_dead_bit) || vehicle->object.up.k < 0.5f ||
++		magnitude3d(&vehicle->object.translational_velocity) > 1.f / 60.f)
++		return FALSE;
++	definition = unit_definition_get(vehicle->definition_index);
 +	object_get_origin(unit_index, &origin);
-+	for (seat_index = 0; seat_index < definition->unit.seats.count; seat_index++)
++	for (index = 0; index < definition->unit.seats.count; index++)
 +	{
-+		real_point3d point;
-+		real_point3d seat;
-+		long occupant_index = NONE;
++		struct unit_seat *seat = TAG_BLOCK_GET_ELEMENT(&definition->unit.seats, index, struct unit_seat);
++		real_point3d point, seat_point;
++		struct object_marker marker;
++		long occupant = NONE;
++		real distance;
++		boolean gunner = TEST_FLAG(seat->flags, _unit_seat_gunner_bit);
 +
-+		if (unit_get_seat_entrance_point(unit_index, vehicle_index, seat_index, &point, &seat, NULL) &&
-+			unit_can_enter_seat(unit_index, vehicle_index, seat_index, &occupant_index) &&
-+			distance3d(&origin, &point) < best)
++		if (TEST_FLAG(seat->flags, _unit_seat_driver_bit) ||
++			!unit_has_animation_to_enter_seat(unit_index, vehicle_index, index) ||
++			!object_get_marker_by_name(vehicle_index, seat->marker_name, &marker, 1) ||
++			!unit_can_enter_seat(unit_index, vehicle_index, index, &occupant) || occupant != NONE ||
++			!unit_get_seat_entrance_point(unit_index, vehicle_index, index, &point, &seat_point, NULL))
++			continue;
++		distance = distance3d(&origin, &point);
++		if (*selected == NONE || (gunner && !best_gunner) || (gunner == best_gunner && distance < best))
 +		{
-+			best = distance3d(&origin, &point);
++			*selected = index;
 +			*entrance = point;
++			best = distance;
++			best_gunner = gunner;
 +		}
 +	}
-+	return best < REAL_MAX;
++	return *selected != NONE;
++}
++
++static boolean companion_seat_entrance(long unit_index, long vehicle_index, real_point3d *entrance)
++{
++	short seat;
++	return companion_vehicle_seat(unit_index, vehicle_index, &seat, entrance);
 +}
 +
 +/* the ground at a point of the player's view (-1 to 1 across, and down, as
@@ -3836,11 +3950,18 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	struct path_result result;
 +	real_point3d start;
 +	real_point3d goal = *point;
-+	long start_surface_index = companion_navigation_start(unit_index, &start);
-+	long goal_surface_index = companion_goal_surface(unit_index, &goal);
++	long start_surface_index;
++	long goal_surface_index = NONE;
 +	boolean reachable;
 +
-+	if (start_surface_index == NONE || goal_surface_index == NONE)
++	if (unit_get(unit_index)->object.parent_object_index != NONE)
++	{
++		if (!companion_vehicle_exit_point(unit_index, &start) ||
++			!companion_ground_sample(unit_index, &start, 0.1f, 0.15f, &start, &start_surface_index)) return FALSE;
++	}
++	else start_surface_index = companion_navigation_start(unit_index, &start);
++	if (!companion_ground_sample(unit_index, &goal, 0.1f, 0.15f, &goal, &goal_surface_index) ||
++		!companion_walkable_surface(goal_surface_index) || start_surface_index == NONE || goal_surface_index == NONE)
 +		return FALSE;
 +	path_input_new(&input, companion_navigation_radius(unit_index), FALSE, unit_index);
 +	path_input_set_start(&input, &start, start_surface_index);
@@ -4154,6 +4275,242 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	collision_move_pill(_collision_test_for_bipeds_living_flags, &base, &movement,
 +		height, radius + 0.02f, unit_index, &clipped, &velocity, 16, collisions);
 +	return distance3d(&clipped, &end) < 0.02f;
++}
++
++/* Voluntary exits use a standing footprint beside the authored entrance.
++No airborne, overturned or moving exits, and no native teleport fallback. */
++static boolean companion_vehicle_exit_point(long unit_index, real_point3d *point)
++{
++	struct unit_datum *unit = unit_get(unit_index);
++	long parent = unit->object.parent_object_index;
++	struct unit_datum *vehicle = parent == NONE ? NULL : unit_try_and_get(parent);
++	real_point3d entrance, seat, base, support, fixed, pill_base;
++	struct biped_definition *definition = biped_definition_get(unit->definition_index);
++	real_vector3d outward;
++	long surface;
++	short attempt;
++
++	if (!vehicle || vehicle->object.type != _object_type_vehicle || vehicle->object.up.k < 0.5f ||
++		magnitude3d(&vehicle->object.translational_velocity) > 1.f / 60.f ||
++		!unit_get_seat_entrance_point(unit_index, parent, unit->unit.parent_seat_index, &entrance, &seat, NULL))
++		return FALSE;
++	object_get_origin(parent, &base);
++	/* The vehicle itself must be close to supporting level geometry. */
++	if (!companion_ground_sample(unit_index, &base, 0.1f, 1.2f, &support, &surface) ||
++		!companion_walkable_surface(surface)) return FALSE;
++	vector_from_points3d(&base, &entrance, &outward);
++	outward.k = 0.f;
++	if (normalize3d(&outward) < 0.01f) return FALSE;
++	for (attempt = 0; attempt < 4; attempt++)
++	{
++		real_point3d candidate = entrance;
++		point_from_line3d(&candidate, &outward, 0.4f * attempt, &candidate);
++		candidate.z = support.z;
++		if (!companion_ground_support(unit_index, &candidate, 0.35f, 0.3f, point, &surface) ||
++			!companion_walkable_surface(surface)) continue;
++		point->z += 0.03f;
++		pill_base = *point;
++		if (!TEST_FLAG(definition->biped.flags, _biped_pill_centered_at_origin_bit))
++			pill_base.z += definition->biped.collision_radius;
++		if (!companion_clearance(unit_index, point, point) ||
++			!biped_fix_position(unit_index, parent, &pill_base, &fixed, 0.f, FALSE, TRUE, FALSE) ||
++			distance3d(point, &fixed) > 0.15f ||
++			!companion_ground(unit_index, &fixed, 0.1f, 0.15f, &candidate) ||
++			!companion_clearance(unit_index, &fixed, &fixed)) continue;
++		*point = fixed;
++		return TRUE;
++	}
++	return FALSE;
++}
++
++/* Called immediately before detachment, after the exit animation. Only our
++voluntary exits are gated; death, scripts and destruction retain native rules. */
++boolean companion_allow_seat_exit(long unit_index)
++{
++	if (unit_index != companion_unit_index || !companion_body.ride_exit_pending ||
++		!companion_unit_alive(unit_index) ||
++		!companion_unit_alive(unit_get(unit_index)->object.parent_object_index)) return TRUE;
++	companion_body.ride_exit_approved = companion_vehicle_exit_point(unit_index, &companion_body.ride_exit_point);
++	if (!companion_body.ride_exit_approved)
++	{
++		companion_body.ride_exit_pending = FALSE;
++		companion_body.ride_check = game_time_get() + TICKS_PER_SECOND / 2;
++		platform_log("Kevin vehicle: exit deferred; no safe standing ground");
++	}
++	return companion_body.ride_exit_approved;
++}
++
++/* Called by biped_exit_seat_end in place of its generic relocation fallback. */
++boolean companion_finish_seat_exit(long unit_index)
++{
++	if (unit_index != companion_unit_index || !companion_body.ride_exit_approved) return FALSE;
++	object_set_position(unit_index, &companion_body.ride_exit_point, NULL, NULL);
++	unit_get(unit_index)->object.translational_velocity = *global_zero_vector3d;
++	companion_body.ride_exit_pending = FALSE;
++	return TRUE;
++}
++
++boolean companion_seat_exit_complete(long unit_index)
++{
++	return unit_index == companion_unit_index && companion_body.ride_exit_approved;
++}
++
++static void companion_vehicle_cancel(long retry)
++{
++	if (companion_body.ride_vehicle != NONE)
++	{
++		companion_body.goal_valid = companion_body.path_valid = FALSE;
++		companion_body.safety[0].valid = companion_body.safety[1].valid = FALSE;
++		companion_body.requested_move = FALSE;
++	}
++	companion_body.ride_vehicle = NONE;
++	companion_body.ride_seat = NONE;
++	companion_body.ride_goal_valid = FALSE;
++	companion_body.ride_retry = retry;
++}
++
++/* At most two seat/ground evaluations per second. Entry is still rechecked
++by unit_enter_seat; no fake entry and no seat replacement is permitted. */
++static void companion_vehicle_note(char const *reason)
++{
++	if (!config_boolean("debug.companion") || reason == companion_body.ride_reason ||
++		game_time_get() < companion_body.ride_log_time) return;
++	platform_log("Kevin vehicle: %s candidate=%08lx seat=%d order=%d failures=%d", reason,
++		companion_body.ride_vehicle, companion_body.ride_seat, companion_body.order, companion_body.failures);
++	companion_body.ride_reason = reason;
++	companion_body.ride_log_time = game_time_get() + TICKS_PER_SECOND;
++}
++
++static void companion_vehicle_update(long unit_index, long player_unit_index)
++{
++	struct unit_datum *unit = unit_get(unit_index);
++	long parent = unit->object.parent_object_index;
++	long chief_vehicle = unit_get(player_unit_index)->object.parent_object_index;
++	long now = game_time_get();
++	real_point3d origin, entrance, seat, hint, ground;
++	real_vector3d facing;
++	long occupant = NONE;
++	short selected;
++	struct unit_datum *vehicle;
++
++	companion_body.ride_waiting = parent == NONE && companion_body.order == _companion_order_follow && chief_vehicle != NONE;
++	if (parent != NONE)
++	{
++		companion_vehicle_cancel(now + TICKS_PER_SECOND);
++		if (companion_body.order == _companion_order_follow && chief_vehicle == parent)
++		{
++			companion_vehicle_note("riding with Chief");
++			return;
++		}
++		if (now < companion_body.ride_check || companion_body.ride_exit_pending ||
++			unit->unit.animation.state == _unit_state_entering_seat ||
++			unit->unit.animation.state == _unit_state_exiting_seat) return;
++		companion_body.ride_check = now + TICKS_PER_SECOND / 2;
++		if (companion_vehicle_exit_point(unit_index, &companion_body.ride_exit_point))
++		{
++			companion_body.ride_exit_pending = TRUE;
++			if (!unit_try_and_exit_seat(unit_index)) companion_body.ride_exit_pending = FALSE;
++			else platform_log("Kevin vehicle: safe exit started vehicle=%08lx", parent);
++		}
++		return;
++	}
++	if (companion_body.ride_hold_after_exit)
++	{
++		object_get_origin(unit_index, &companion_body.hold_point);
++		companion_body.ride_hold_after_exit = FALSE;
++		companion_body.goal_valid = companion_body.path_valid = FALSE;
++	}
++	companion_body.ride_exit_pending = companion_body.ride_exit_approved = FALSE;
++	if (companion_body.order != _companion_order_follow || chief_vehicle == NONE)
++	{
++		companion_vehicle_cancel(0);
++		return;
++	}
++	if (companion_body.ride_vehicle != NONE && companion_body.ride_vehicle != chief_vehicle)
++		companion_vehicle_cancel(0);
++	if (now < companion_body.ride_retry || now < companion_body.ride_check) return;
++	companion_body.ride_check = now + TICKS_PER_SECOND / 2;
++	object_get_origin(unit_index, &origin);
++	if (companion_body.ride_vehicle == NONE)
++	{
++		if (!companion_vehicle_seat(unit_index, chief_vehicle, &selected, &entrance))
++		{
++			companion_vehicle_note("waiting for stopped vehicle and compatible free seat");
++			return;
++		}
++		companion_body.ride_vehicle = chief_vehicle;
++		companion_body.ride_seat = selected;
++		companion_body.ride_progress = origin;
++		companion_body.ride_progress_time = now;
++		/* A newly selected seat is a genuinely new route purpose. */
++		companion_body.failures = companion_body.recovery = 0;
++		companion_body.progress_time = now;
++		companion_body.goal_valid = companion_body.path_valid = FALSE;
++		companion_body.combat_ground_valid = FALSE;
++		platform_log("Kevin vehicle: approaching vehicle=%08lx seat=%d", chief_vehicle, selected);
++	}
++	vehicle = unit_try_and_get(chief_vehicle);
++	selected = companion_body.ride_seat;
++	if (!vehicle || TEST_FLAG(vehicle->object.damage_flags, _object_dead_bit) ||
++		!unit_can_enter_seat(unit_index, chief_vehicle, selected, &occupant) || occupant != NONE ||
++		!unit_has_animation_to_enter_seat(unit_index, chief_vehicle, selected) ||
++		!unit_get_seat_entrance_point(unit_index, chief_vehicle, selected, &entrance, &seat, &hint))
++	{
++		companion_vehicle_cancel(now + 5 * TICKS_PER_SECOND);
++		return;
++	}
++	if (distance3d(&origin, &companion_body.ride_progress) > 0.2f)
++	{
++		companion_body.ride_progress = origin;
++		companion_body.ride_progress_time = now;
++	}
++	if (companion_body.failures >= 5 || now - companion_body.ride_progress_time > 40 * TICKS_PER_SECOND)
++	{
++		platform_log("Kevin vehicle: approach abandoned; bounded retry");
++		companion_vehicle_cancel(now + 5 * TICKS_PER_SECOND);
++		return;
++	}
++	companion_body.ride_goal_valid = FALSE;
++	if (vehicle->object.up.k < 0.5f || magnitude3d(&vehicle->object.translational_velocity) > 1.f / 60.f)
++	{
++		companion_vehicle_note("approach paused; vehicle moving or overturned");
++		return;
++	}
++	vector_from_points3d(&origin, &seat, &facing);
++	facing.k = 0.f;
++	if (normalize3d(&facing) < 0.01f) facing = unit->object.forward;
++	companion_body.ride_facing = facing;
++	if (!companion_ground(unit_index, &entrance, 0.5f, 1.5f, &ground))
++	{
++		companion_vehicle_note("entrance ground rejected");
++		return;
++	}
++	ground.z += 0.03f;
++	if (!companion_clearance(unit_index, &ground, &ground))
++	{
++		companion_vehicle_note("entrance standing clearance rejected");
++		return;
++	}
++	/* Native uses horizontal distance to the nearer entrance/seat point. */
++	if (MIN(companion_flat_distance(&origin, &entrance), companion_flat_distance(&origin, &seat)) < 0.7f &&
++		fabs(origin.z - entrance.z) < 1.f &&
++		!TEST_FLAG(biped_get(unit_index)->biped.flags, _biped_airborne_bit) &&
++		!unit_is_busy(unit_index) &&
++		dot_product3d(&facing, &unit->object.forward) > 0.6f &&
++		companion_clearance(unit_index, &origin, &ground))
++	{
++		unit_enter_seat(unit_index, chief_vehicle, selected);
++		if (unit_get(unit_index)->object.parent_object_index == chief_vehicle)
++		{
++			platform_log("Kevin vehicle: boarded vehicle=%08lx seat=%d", chief_vehicle, selected);
++			companion_body.jumping = companion_body.auto_crouch = FALSE;
++			companion_vehicle_cancel(now + TICKS_PER_SECOND);
++			return;
++		}
++	}
++	companion_body.ride_goal = ground;
++	companion_body.ride_goal_valid = TRUE;
++	companion_vehicle_note("routing to verified entrance");
 +}
 +
 +static void companion_navigation_note(char const *reason)
@@ -5893,11 +6250,23 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		companion_body.requested_move = FALSE;
 +		return;
 +	}
-+	combat_goal = companion_combat_goal(unit_index, player_unit_index, target, &goal);
-+	if (combat_goal)
-+		wanted = distance3d(&origin, &goal) > 0.2f;
++	combat_goal = FALSE;
++	if (companion_body.ride_waiting || companion_body.ride_vehicle != NONE)
++	{
++		/* Riding suppresses tactical destinations, not fire permission. */
++		companion_body.combat_ground_valid = FALSE;
++		companion_body.pace = 1.f;
++		goal = companion_body.ride_goal;
++		wanted = companion_body.ride_goal_valid && distance3d(&origin, &goal) > 0.15f;
++	}
 +	else
-+		wanted = companion_goal(unit_index, player_unit_index, target, &goal);
++	{
++		combat_goal = companion_combat_goal(unit_index, player_unit_index, target, &goal);
++		if (combat_goal)
++			wanted = distance3d(&origin, &goal) > 0.2f;
++		else
++			wanted = companion_goal(unit_index, player_unit_index, target, &goal);
++	}
 +	if ((wanted || combat_goal) && companion_body.order != _companion_order_hold &&
 +		companion_body.nav_state == _companion_nav_invalid_surface &&
 +		companion_escape_footprint(unit_index, direction)) return;
@@ -6261,7 +6630,8 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +
 +void companion_note_projectile(long owner_unit_index)
 +{
-+	if (companion_unit_index != NONE && owner_unit_index == companion_unit_index)
++	if (companion_unit_index != NONE && (owner_unit_index == companion_unit_index ||
++		owner_unit_index == companion_weapon_owner(companion_unit_index)))
 +		companion_body.combat_metrics.emitted++;
 +}
 +
@@ -6281,6 +6651,17 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	companion_body.combat_physics_log_time = game_time_get() + TICKS_PER_SECOND;
 +}
 +
++static unsigned long companion_seated_controls(long unit_index, unsigned long flags)
++{
++	struct unit_datum *unit = unit_get(unit_index);
++
++	if (unit->object.parent_object_index == NONE) return flags;
++	/* No action button, vehicle throttle, jump, grenades or weapon swapping. */
++	if (unit->unit.animation.state == _unit_state_entering_seat ||
++		unit->unit.animation.state == _unit_state_exiting_seat) return 0;
++	return flags & (FLAG(_unit_control_weapon_primary_trigger_bit) | FLAG(_unit_control_weapon_reload_bit));
++}
++
 +static void companion_control(
 +	long unit_index,
 +	long player_unit_index)
@@ -6289,7 +6670,8 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	struct companion_enemy *target = companion_current_target();
 +	struct companion_enemy *act_target = companion_enemy_get(companion_body.act_target_unit_index);
 +	long act_ticks = game_time_get() - companion_body.act_time;
-+	long held_weapon_index = unit_inventory_get_weapon(unit_index, unit->unit.current_weapon_index);
++	long owner = companion_weapon_owner(unit_index);
++	long held_weapon_index = unit_inventory_get_weapon(owner, unit_get(owner)->unit.current_weapon_index);
 +	short grenade_index = NONE;
 +	short weapon_choice = NONE;
 +	real turn;
@@ -6407,6 +6789,8 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +			normalize3d(&desired);
 +		}
 +	}
++	if (companion_body.ride_vehicle != NONE && companion_body.ride_goal_valid)
++		desired = companion_body.ride_facing;
 +	if (target && target->visible)
 +		companion_body.aim = desired; /* native unit aiming supplies acceleration and animation limits */
 +	else
@@ -6451,7 +6835,10 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	/* No model request: the native solution and both fresh firing rays decide. */
 +	companion_body.fire_reason = !target ? "no target" : !target->visible ? "target not visible" :
 +		!companion_target_in_firing_range(target) ? "outside weapon range" : "no native aim solution";
-+	fire_request = solution && companion_fire_requested(unit_index, target, &shot);
++	fire_request = solution && companion_body.ride_vehicle == NONE &&
++		unit->unit.animation.state != _unit_state_entering_seat &&
++		unit->unit.animation.state != _unit_state_exiting_seat &&
++		companion_fire_requested(unit_index, target, &shot);
 +	if (solution && !fire_request)
 +		companion_body.combat_metrics.fire_not_ready++;
 +	SET_FLAG(flags, _unit_control_weapon_primary_trigger_bit, fire_request);
@@ -6466,9 +6853,10 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	/* Combat selects the standing/crouching base seat; aiming speed is separate. */
 +	control.animation_state = _unit_animation_state_in_combat;
 +	control.aiming_speed = _unit_aiming_speed_alert;
++	flags = companion_seated_controls(unit_index, flags);
 +	control.control_flags = (word)flags;
-+	control.weapon_index = weapon_choice;
-+	control.grenade_index = grenade_index;
++	control.weapon_index = unit->object.parent_object_index != NONE ? NONE : weapon_choice;
++	control.grenade_index = unit->object.parent_object_index != NONE ? NONE : grenade_index;
 +	control.zoom_level = NONE;
 +	companion_movement_throttle(unit_index, &walk, &facing, &control.throttle);
 +	control.primary_trigger = TEST_FLAG(flags, _unit_control_weapon_primary_trigger_bit) ? 1.f : 0.f;
@@ -6509,7 +6897,11 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +	if (order != companion_body.order)
 +	{
 +		if (order == _companion_order_hold && companion_unit_index != NONE)
++		{
 +			object_get_origin(companion_unit_index, &companion_body.hold_point);
++			companion_body.ride_hold_after_exit = unit_get(companion_unit_index)->object.parent_object_index != NONE;
++		}
++		else companion_body.ride_hold_after_exit = FALSE;
 +		companion_body.goal_valid = FALSE;
 +		companion_body.path_valid = FALSE;
 +		companion_body.safety[0].valid = companion_body.safety[1].valid = FALSE;
@@ -6689,9 +7081,11 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +		order = _companion_order_move;
 +	}
 +	else return "Unsupported command; orders unchanged.";
++	if (order != _companion_order_hold) companion_body.ride_hold_after_exit = FALSE;
 +	companion_set_order(order, NONE, hold_fire);
 +	if (!strcmp(action, "stay"))
 +	{
++		companion_body.ride_hold_after_exit = unit_get(companion_unit_index)->object.parent_object_index != NONE;
 +		object_get_origin(companion_unit_index, &companion_body.hold_point);
 +		companion_body.goal_valid = FALSE;
 +		companion_body.jumping = FALSE;
@@ -8049,6 +8443,7 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +
 +	if (companion_unit_index != NONE)
 +	{
++		companion_vehicle_update(companion_unit_index, player_unit_index);
 +		companion_look_around(companion_unit_index, player_unit_index);
 +		companion_update_target(companion_unit_index);
 +		companion_catch_up(companion_unit_index, player_unit_index);
@@ -8060,10 +8455,10 @@ index 0000000000000000000000000000000000000000..3cd36f00439a864faa3f014b1713f4c5
 +}
 diff --git a/port/linux/game/companion.h b/port/linux/game/companion.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..2ccec1e2544b4d352ae2e26c2176369f3741e61e
+index 0000000000000000000000000000000000000000..44437cd5d79125bde4bac8a6b75038d33c96f151
 --- /dev/null
 +++ b/port/linux/game/companion.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,54 @@
 +#ifndef __COMPANION_H
 +#define __COMPANION_H
 +
@@ -8080,6 +8475,10 @@ index 0000000000000000000000000000000000000000..2ccec1e2544b4d352ae2e26c2176369f
 +void companion_note_physics(long unit_index, union real_vector3d const *desired,
 +	union real_point3d const *before, union real_point3d const *after, union real_vector3d const *velocity,
 +	unsigned short in_flags, unsigned short out_flags, float collision_velocity);
++/* Voluntary companion dismount safety; forced native removals pass through. */
++boolean companion_allow_seat_exit(long unit_index);
++boolean companion_finish_seat_exit(long unit_index);
++boolean companion_seat_exit_complete(long unit_index);
 +/* the icon of the microphone Kevin hears the player by, open or muted
 +(interface.c, after the HUD) */
 +void companion_draw_mic(
@@ -9184,7 +9583,7 @@ index 113aa8e1279df36efbf4fb8a358d8a0ba350c189..1ffb8cb4576bd2fcf99fb56c8f93b127
  /* ---------- globals */
  
 diff --git a/source/units/bipeds.c b/source/units/bipeds.c
-index f94b9f993517d071bc2165dd42981a577f8bc5af..50e008ecc129e0b22341a5d2b500a45d6800be56 100644
+index f94b9f993517d071bc2165dd42981a577f8bc5af..4b00a825246ab5a81dd3d618a4d4632479af7cc2 100644
 --- a/source/units/bipeds.c
 +++ b/source/units/bipeds.c
 @@ -276,6 +276,7 @@ symbols in this file:
@@ -9195,7 +9594,17 @@ index f94b9f993517d071bc2165dd42981a577f8bc5af..50e008ecc129e0b22341a5d2b500a45d
  
  /* port: port/linux/game/network_objects.c's (a client deletes the host's
  objects on the host's word alone) */
-@@ -4018,6 +4019,10 @@ static void biped_update_moving(
+@@ -1358,6 +1359,9 @@ void biped_exit_seat_end(
+ 	biped->object.up = *global_up3d;
+ 	SET_FLAG(biped->biped.flags, _biped_airborne_bit, TRUE);
+ 
++	/* port: Kevin already verified this standing landing; no generic relocation. */
++	if (companion_finish_seat_exit(biped_index)) return;
++
+ 	if (!biped_fix_position(biped_index, seat_object_index, NULL, 0, 2.f, TRUE, FALSE, TRUE))
+ 	{
+ 		real_point3d center;
+@@ -4018,6 +4022,10 @@ static void biped_update_moving(
  		physics.velocity = *global_zero_vector3d;
  	}
  
@@ -9206,6 +9615,34 @@ index f94b9f993517d071bc2165dd42981a577f8bc5af..50e008ecc129e0b22341a5d2b500a45d
  	{
  		real_point3d new_biped_position = physics.new_position;
  		word out_flags = physics.out_flags;
+diff --git a/source/units/units.c b/source/units/units.c
+index 2500a4080d3b58985a18dbb4b3dff70fee0c79ad..3520d0587d98f573d882e219f1c5177a1eef7d75 100644
+--- a/source/units/units.c
++++ b/source/units/units.c
+@@ -644,6 +644,7 @@ symbols in this file:
+ /* ---------- headers */
+ 
+ #include "cseries.h"
++#include "companion.h" /* port: Kevin voluntary seat-exit safety */
+ #include "units.h"
+ 
+ #include "bipeds.h"
+@@ -10409,7 +10410,15 @@ short unit_update_animation(
+ 					object_get_world_matrix(unit_index, &old_world_matrix),
+ 					&exit_velocity,
+ 					&exit_velocity);
++				/* port: gate voluntary animation completion, never forced/scripted removal. */
++				if (!companion_allow_seat_exit(unit_index))
++				{
++					unit_animation_set_state(unit_index, _unit_state_idle);
++					break;
++				}
+ 				unit_exit_seat_end(unit_index);
++				/* port: a deferred Kevin exit remains seated, without exit impulse. */
++				if (unit->object.parent_object_index != NONE || companion_seat_exit_complete(unit_index)) break;
+ 				add_vectors3d(
+ 					&unit->object.translational_velocity,
+ 					&exit_velocity,
 diff --git a/tools/ce_menus.py b/tools/ce_menus.py
 index be0bf6fc138d9c7bfbea6c9a7e2144901bbe46e9..754a6c1adeb8a01ed927778cb2c80eaa1afe6ec9 100644
 --- a/tools/ce_menus.py
@@ -9240,10 +9677,10 @@ index be0bf6fc138d9c7bfbea6c9a7e2144901bbe46e9..754a6c1adeb8a01ed927778cb2c80eaa
      lines.append(art.port_picture("blank", [
 diff --git a/tools/harness/tests/companion.c b/tools/harness/tests/companion.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..382a500669955d204cb7050d6ad676085b67637e
+index 0000000000000000000000000000000000000000..624bebe1b1424bd8cb2d30d1891695e4d5cc082f
 --- /dev/null
 +++ b/tools/harness/tests/companion.c
-@@ -0,0 +1,1479 @@
+@@ -0,0 +1,1494 @@
 +#include "harness.h"
 +#include <math.h>
 +#define TICKS_PER_SECOND 30
@@ -9482,9 +9919,9 @@ index 0000000000000000000000000000000000000000..382a500669955d204cb7050d6ad67608
 +}
 +int main(int argc,char **argv){
 + const char *case_name=argv[1];real_vector3d walk={1,0,0};real_point3d goal;
-+ memset(&companion_body,0,sizeof(companion_body));
++ memset(&companion_body,0,sizeof(companion_body));companion_body.ride_vehicle=NONE;
 + fake_globals.player_information.address=&fake_information;
-+ for(int body=0;body<5;body++)bodies[body].unit.actor_index=NONE;
++ for(int body=0;body<5;body++){bodies[body].unit.actor_index=NONE;bodies[body].object.parent_object_index=NONE;}
 + fake_definition.biped.collision_radius=0.1f;fake_definition.biped.runtime_minimum_normal_k=0.6f;fake_definition.biped.jump_velocity=0.08f;
 + bodies[0].object.shield_vitality=1;fake_information.run_acceleration=0.32f;fake_information.run_forward_speed=2.25f;fake_information.run_backward_speed=2.f;fake_information.run_sideways_speed=2.f;fake_definition.biped.collision_height_standing=0.7f;fake_definition.biped.collision_height_crouching=0.4f;
 + fake_information.sneak_forward_speed=1;fake_information.sneak_backward_speed=0.8f;fake_information.sneak_sideways_speed=0.7f;fake_information.sneak_acceleration=0.16f;
@@ -10713,6 +11150,21 @@ index 0000000000000000000000000000000000000000..382a500669955d204cb7050d6ad67608
 +  drop_at=1000;walkable_surfaces[2]=0;
 +  CHECK(!companion_safe_direction(0,&walk),"unsupported navigation surface stays blocked");
 + }
++
++ CASE("vehicle-approach-route"){
++  companion_body.ride_vehicle=4;companion_body.ride_goal_valid=TRUE;companion_body.ride_goal=(real_point3d){3,0,0};
++  companion_body.combat_ground_valid=TRUE;companion_body.combat_ground_goal=(real_point3d){0,10,0};
++  companion_walk_direction(0,1,NULL,&walk);
++  CHECK(walk.i>0.5f&&fabsf(walk.j)<0.05f&&!companion_body.combat_ground_valid,"vehicle entrance uses safe navigation, stale combat route cannot override");
++ }
++ CASE("vehicle-approach-cliff"){
++  companion_body.ride_vehicle=4;companion_body.ride_goal_valid=TRUE;companion_body.ride_goal=(real_point3d){3,0,0};drop_at=0.3f;
++  companion_walk_direction(0,1,NULL,&walk);CHECK(magnitude3d(&walk)==0,"boarding cannot bypass cliff protection");
++ }
++ CASE("vehicle-no-seat-wait"){
++  companion_body.ride_waiting=TRUE;companion_walk_direction(0,1,NULL,&walk);
++  CHECK(magnitude3d(&walk)==0&&!builds,"no free seat waits instead of routing into Chief's vehicle hull");
++ }
 + CASE("cache-jump"){
 +  CHECK(companion_safe_direction(0,&walk),"prime");obstacle=TRUE;ceiling=TRUE;
 +  CHECK(!companion_try_jump(0,&walk),"cached walk cannot authorize unsafe jump");CHECK(!companion_body.safety[0].valid,"jump invalidates cache");
@@ -10725,11 +11177,12 @@ index 0000000000000000000000000000000000000000..382a500669955d204cb7050d6ad67608
 +}
 diff --git a/tools/harness/tests/companion_combat.c b/tools/harness/tests/companion_combat.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..c3aa487f67bcad226b4ab9402a89f5fd6cc52e54
+index 0000000000000000000000000000000000000000..5bff87d67084e7455e3e3cd1c102d142e1f9b9c2
 --- /dev/null
 +++ b/tools/harness/tests/companion_combat.c
-@@ -0,0 +1,632 @@
+@@ -0,0 +1,655 @@
 +#include "harness.h"
++#define _object_type_vehicle 1
 +#include <math.h>
 +#undef CASE
 +#define CASE(name) if (!strcmp(case_name, name) && (++matched))
@@ -10794,7 +11247,7 @@ index 0000000000000000000000000000000000000000..c3aa487f67bcad226b4ab9402a89f5fd
 +#define game_difficulty_get_team_value(type,team) difficulty_scales[type]
 +struct path_result { int unused; };
 +struct unit_attacker {unsigned long game_time_stamp;real damage_inflicted;long object_index,player_index;};
-+struct unit_datum {long definition_index;struct {unsigned damage_flags,flags;short type,owner_team_index;long parent_object_index;real_point3d bounding_sphere_center;real bounding_sphere_radius;real_vector3d forward,translational_velocity;} object;struct {short current_weapon_index;unsigned control_flags;real_vector3d aiming_vector;struct unit_attacker attackers[4];} unit;};
++struct unit_datum {long definition_index;struct {unsigned damage_flags,flags;short type,owner_team_index;long parent_object_index;real_point3d bounding_sphere_center;real bounding_sphere_radius;real_vector3d forward,translational_velocity;} object;struct {short current_weapon_index;long gunner_object_index;unsigned control_flags;real_vector3d aiming_vector;struct unit_attacker attackers[4];} unit;};
 +struct tag_reference {long index;};
 +struct weapon_trigger_definition {unsigned flags;real initial_rate_of_fire,final_rate_of_fire,charging_time,projectile_error_angle_upper_bound,projectile_distribution_angle;short magazine_index,minimum_rounds_loaded_per_shot;struct tag_reference projectile;};
 +struct weapon_definition {struct {struct {short count;} triggers,magazines;struct tag_reference ai_firing_parameters;real ai_minimum_target_range;} weapon;};
@@ -10806,7 +11259,7 @@ index 0000000000000000000000000000000000000000..c3aa487f67bcad226b4ab9402a89f5fd
 +struct actor_variant_definition {struct tag_reference actor_reference;struct actor_ranged_combat_properties ranged_combat;};
 +struct actor_definition {short type;unsigned flags;struct {real friend_avoidance_radius,combat_position_time_lower_bound,combat_position_time_upper_bound;} firing_position;struct {real maximum_vision_distance,peripheral_distance,central_vision_angle,maximum_vision_angle,peripheral_vision_angle;} perception;};
 +struct unit_definition {struct {unsigned flags;} unit;};
-+struct object_marker {struct {real_point3d position;} matrix;};
++struct object_marker {struct {real_point3d position;real_vector3d forward;} matrix;};
 +struct tag_iterator {int index;};
 +struct object_iterator {long index;};
 +struct collision_result {short type;long object_index;real_point3d point;struct {real_vector3d n;} plane;};
@@ -10830,7 +11283,9 @@ index 0000000000000000000000000000000000000000..c3aa487f67bcad226b4ab9402a89f5fd
 +static long companion_context_serial;
 +static struct companion_command_context companion_contexts[32];
 +static real_point3d aimed_ground={2,3,0},marker_origin;
-+static real_vector3d actual_aim={1,0,0};
++static real_vector3d actual_aim={1,0,0},marker_forward={1,0,0};
++static short marker_count=1;
++static long inventory_owner;
 +static void unit_get_aiming_vector(long i,real_vector3d *out){*out=actual_aim;}
 +static void scale_vector3d(const real_vector3d *v,real scale,real_vector3d *out){out->i=v->i*scale;out->j=v->j*scale;out->k=v->k*scale;}
 +static void point_from_line3d(const real_point3d *p,const real_vector3d *v,real t,real_point3d *o){o->x=p->x+v->i*t;o->y=p->y+v->j*t;o->z=p->z+v->k*t;}
@@ -10847,7 +11302,7 @@ index 0000000000000000000000000000000000000000..c3aa487f67bcad226b4ab9402a89f5fd
 +#define object_get unit_get
 +static struct unit_datum *unit_get(long i){return &units[i&0xffff];}
 +static struct unit_datum *unit_try_and_get(long i){return (i>=0 && (i&0xffff)<5)?unit_get(i):NULL;}
-+static long unit_inventory_get_weapon(long i,short w){return held_weapon;}
++static long unit_inventory_get_weapon(long i,short w){inventory_owner=i;return held_weapon;}
 +static boolean game_team_is_enemy(short a,short b){return a!=b;}
 +static void unit_get_camera_position(long i,real_point3d *p){p->x=p->y=p->z=0;}
 +static void object_get_origin(long i,real_point3d *p){*p=unit_get(i)->object.bounding_sphere_center;}
@@ -10866,7 +11321,7 @@ index 0000000000000000000000000000000000000000..c3aa487f67bcad226b4ab9402a89f5fd
 +static struct unit_datum *object_iterator_next(struct object_iterator *i){return ++i->index<5?&units[i->index]:NULL;}
 +static void tag_iterator_new(struct tag_iterator *i,long group){i->index=0;tag_scans++;}
 +static long tag_iterator_next(struct tag_iterator *i){return i->index++==0?0:NONE;}
-+static int object_get_marker_by_name(long i,const char *s,struct object_marker *m,short n){marker_object=i;m->matrix.position=marker_origin;return !missing_marker;}
++static int object_get_marker_by_name(long i,const char *s,struct object_marker *m,short n){marker_object=i;if(missing_marker)return 0;for(short j=0;j<MIN(n,marker_count);j++){m[j].matrix.position=marker_origin;m[j].matrix.position.z+=j*0.2f;m[j].matrix.forward=marker_forward;}return MIN(n,marker_count);}
 +#ifndef NATIVE_WEAPON_MATH
 +static void unit_adjust_projectile_ray(long i,real_point3d *o,real_vector3d *v,real *velocity,boolean adjust,boolean aiming){*velocity=0;}
 +#else
@@ -11328,6 +11783,26 @@ index 0000000000000000000000000000000000000000..c3aa487f67bcad226b4ab9402a89f5fd
 +  CHECK(companion_firing_origin(0,7,&aim,&firing)&&fabsf(firing.x-0.2f)<0.00001f&&firing.y==0&&firing.z==0,"native camera projection agrees with projectile spawn origin");
 +  CHECK(marker_object==0,"hidden weapon uses parent's trigger marker, as native spawning does");
 + }
++
++ if(strncmp(case_name,"mounted-",8)==0){
++  units[0].object.parent_object_index=4;units[4].object.type=_object_type_vehicle;units[4].unit.gunner_object_index=0;units[4].object.owner_team_index=1;
++  units[4].object.bounding_sphere_center=(real_point3d){1,0,0};units[4].object.bounding_sphere_radius=3;
++  fake_trigger.flags|=FLAG(_weapon_trigger_uses_weapon_origin_bit);fake_weapon.object.flags|=FLAG(_object_invisible_bit);fake_weapon.object.parent_object_index=4;
++  companion_body.combat.initialized=FALSE;companion_update_combat_profile(0);
++ }
++ CASE("mounted-owner"){CHECK(companion_body.combat.mounted&&companion_body.combat.owner_index==4&&inventory_owner==4&&companion_body.combat.supported,"vehicle inventory and origin-trigger supported for native gunner");}
++ CASE("mounted-firing"){ready_shot(&shot);CHECK(companion_fire_requested(0,&companion_enemies[0],&shot),"mounted machinegun safely fires past own hull");CHECK(marker_object==4,"native effect object is vehicle muzzle");companion_note_projectile(4);CHECK(companion_body.combat_metrics.emitted==1,"vehicle projectile attributed to gunner diagnostic");}
++ CASE("mounted-hold-fire"){ready_shot(&shot);companion_body.hold_fire=TRUE;CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"hold fire suppresses mounted trigger immediately");}
++ CASE("mounted-friendly"){ready_shot(&shot);units[1].object.parent_object_index=4;units[1].object.bounding_sphere_center=(real_point3d){2,0,0};CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"Chief in same vehicle remains protected");}
++ CASE("mounted-misaligned"){ready_shot(&shot);marker_forward=(real_vector3d){0,1,0};CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"turret marker alignment overrides aligned biped request");}
++ CASE("mounted-multiple-muzzles"){ready_shot(&shot);marker_count=2;blocked_muzzle=TRUE;CHECK(!companion_fire_requested(0,&companion_enemies[0],&shot),"second native muzzle blocked cancels whole trigger");CHECK(companion_body.combat.muzzle_index==0,"muzzle iteration state restored");}
++ CASE("mounted-too-many-muzzles"){marker_count=9;CHECK(!companion_aim_solution(0,&companion_enemies[0],&shot),"unsupported muzzle count fails closed");}
++ CASE("mounted-unsupported"){fake_projectile.projectile.danger_radius=2;companion_body.combat.initialized=FALSE;companion_update_combat_profile(0);CHECK(!companion_body.combat.supported,"explosive mounted weapons refuse automatic fire");}
++ CASE("mounted-weapon-change"){long profiles=companion_body.combat_metrics.profiles;units[0].object.parent_object_index=NONE;companion_update_combat_profile(0);CHECK(companion_body.combat.owner_index==0&&!companion_body.combat.mounted&&companion_body.combat_metrics.profiles==profiles+1,"dismount invalidates owner even if inventory index reused");}
++ CASE("passenger-owner"){units[0].object.parent_object_index=4;units[4].object.type=_object_type_vehicle;units[4].unit.gunner_object_index=NONE;CHECK(companion_weapon_owner(0)==0,"passenger retains personal weapon owner");}
++
++ CASE("go-aim-seated-order"){units[0].object.parent_object_index=4;CHECK(!companion_apply_command("stay",&context)&&companion_body.ride_hold_after_exit,"seated stay records hold after exit");CHECK(!companion_apply_command("go_aim",&context)&&!companion_body.ride_hold_after_exit&&companion_body.hold_point.x==5,"go-to cannot inherit delayed stay and lose captured destination");}
++ CASE("stay-seated-order"){units[0].object.parent_object_index=4;companion_body.order=_companion_order_hold;CHECK(!companion_apply_command("stay",&context)&&companion_body.ride_hold_after_exit,"repeated seated stay still captures actual landing later");CHECK(!companion_apply_command("hold_fire",&context)&&companion_body.ride_hold_after_exit,"combat permission preserves pending stay");}
 + CASE("combat-state"){
 +  real metres[]={20,49,60,5,100};boolean visible[]={TRUE,TRUE,TRUE,FALSE,FALSE};boolean expected[]={TRUE,TRUE,FALSE,FALSE,FALSE};
 +  companion_enemy_count=1;
@@ -11948,6 +12423,141 @@ index 0000000000000000000000000000000000000000..d1583930a816e2dbb439bae3a29ed061
 + }
 + return 0;
 +}
+diff --git a/tools/harness/tests/companion_vehicle.c b/tools/harness/tests/companion_vehicle.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..360f56e6e93753dfc566f2464cb36a34ffe9addf
+--- /dev/null
++++ b/tools/harness/tests/companion_vehicle.c
+@@ -0,0 +1,129 @@
++#include "harness.h"
++#include <math.h>
++#define config_boolean(x) FALSE
++#define platform_log(...) ((void)0)
++#define MIN(a,b) ((a)<(b)?(a):(b))
++#define REAL_MAX 1e30f
++#define _object_type_vehicle 1
++#define _object_dead_bit 0
++#define _unit_seat_driver_bit 2
++#define _unit_seat_gunner_bit 3
++struct unit_seat {unsigned flags;char marker_name[32];};
++struct object_marker {int unused;};
++static boolean object_get_marker_by_name(long i,char const *name,struct object_marker *m,short n){return TRUE;}
++#define _unit_control_weapon_primary_trigger_bit 0
++#define _unit_control_weapon_reload_bit 1
++#define TICKS_PER_SECOND 30
++#define _unit_state_idle 0
++#define _unit_state_entering_seat 1
++#define _unit_state_exiting_seat 2
++#define _biped_pill_centered_at_origin_bit 0
++#define _biped_airborne_bit 0
++#define biped_get(i) (&units[i])
++#define unit_is_busy(i) busy
++enum {_companion_order_follow,_companion_order_hold,_companion_order_move};
++struct biped_definition {struct {unsigned flags;real collision_radius;} biped;};
++static struct biped_definition body_definition;
++#define biped_definition_get(i) (&body_definition)
++struct unit_datum {long definition_index;struct {short type;unsigned damage_flags;long parent_object_index;real_vector3d up,forward,translational_velocity;} object;struct {short parent_seat_index;struct {short state;} animation;} unit;struct {unsigned flags;} biped;};
++static struct unit_datum units[3];
++static long companion_unit_index=0, now=30, entry_calls, exit_calls, ground_calls;
++static boolean safe=TRUE, exit_ok=TRUE,busy=FALSE;
++static real_point3d origins[3];
++static real_vector3d zero;
++#define global_zero_vector3d (&zero)
++static struct {long ride_vehicle,ride_retry,ride_check,ride_progress_time;short ride_seat,order,failures,recovery;long progress_time;boolean ride_goal_valid,ride_exit_pending,ride_exit_approved,ride_hold_after_exit,ride_waiting,jumping,auto_crouch,goal_valid,path_valid,requested_move,combat_ground_valid,hold_fire;long ride_log_time;char const *ride_reason;real_point3d ride_goal,ride_progress,ride_exit_point,hold_point;real_vector3d ride_facing;struct {boolean valid;} safety[2];struct {long paths;} metrics;} companion_body;
++static struct unit_seat seats[4];
++static struct unit_definition {struct {struct {short count;void *address;} seats;} unit;} fake_definition;
++static boolean compatible[4]={1,1,1,1},free_seats[4]={1,1,1,1},markers[4]={1,1,1,1};
++static long occupants[4]={NONE,NONE,NONE,NONE};
++static real distances[4]={0.5f,1.f,2.f,2.f};
++#define TAG_BLOCK_GET_ELEMENT(b,i,t) (((t *)(b)->address)+(i))
++static struct unit_datum *unit_try_and_get(long i){return i>=0&&i<3?&units[i]:NULL;}
++#define unit_definition_get(i) (&fake_definition)
++static void object_get_origin(long i,real_point3d *p){*p=origins[i];}
++static real magnitude3d(real_vector3d const *v){return sqrtf(v->i*v->i+v->j*v->j+v->k*v->k);}
++static real distance3d(real_point3d const *a,real_point3d const *b){return sqrtf((a->x-b->x)*(a->x-b->x)+(a->y-b->y)*(a->y-b->y)+(a->z-b->z)*(a->z-b->z));}
++static boolean unit_has_animation_to_enter_seat(long u,long v,short s){return compatible[s];}
++static boolean unit_can_enter_seat(long u,long v,short s,long *o){*o=occupants[s];return free_seats[s];}
++static boolean unit_get_seat_entrance_point(long u,long v,short s,real_point3d *p,real_point3d *seat,real_point3d *hint){*p=(real_point3d){distances[s],0,0};*seat=*p;return markers[s];}
++#define unit_get(i) (&units[i])
++static long game_time_get(void){return now;}
++static real dot_product3d(real_vector3d const *a,real_vector3d const *b){return a->i*b->i+a->j*b->j+a->k*b->k;}
++static real normalize3d(real_vector3d *v){real m=magnitude3d(v);if(m){v->i/=m;v->j/=m;v->k/=m;}return m;}
++static void vector_from_points3d(real_point3d const *a,real_point3d const *b,real_vector3d *v){*v=(real_vector3d){b->x-a->x,b->y-a->y,b->z-a->z};}
++static void point_from_line3d(real_point3d const *a,real_vector3d const *v,real t,real_point3d *p){*p=(real_point3d){a->x+v->i*t,a->y+v->j*t,a->z+v->k*t};}
++static real companion_flat_distance(real_point3d const *a,real_point3d const *b){return hypotf(a->x-b->x,a->y-b->y);}
++static boolean companion_unit_alive(long i){return i>=0&&i<3&&!units[i].object.damage_flags;}
++static boolean companion_ground_sample(long i,real_point3d const *p,real a,real b,real_point3d *g,long *surface){ground_calls++;*g=*p;g->z=0;if(surface)*surface=0;return safe;}
++static boolean companion_ground_support(long i,real_point3d const *p,real a,real b,real_point3d *g,long *surface){return companion_ground_sample(i,p,a,b,g,surface);}
++static boolean companion_ground(long i,real_point3d const *p,real a,real b,real_point3d *g){return companion_ground_sample(i,p,a,b,g,NULL);}
++static boolean companion_walkable_surface(long s){return safe;}
++static boolean companion_clearance(long i,real_point3d const *a,real_point3d const *b){return safe;}
++static boolean biped_fix_position(long i,long parent,real_point3d const *p,real_point3d *final,real radius,boolean below,boolean dry,boolean mult){CHECK(dry,"preflight must never move Kevin");*final=*p;final->z-=body_definition.biped.collision_radius;return safe;}
++static void object_set_position(long i,real_point3d const *p,void *a,void *b){origins[i]=*p;}
++static void unit_animation_set_state(long i,short state){units[i].unit.animation.state=state;}
++static void unit_enter_seat(long i,long v,short s){entry_calls++;if(free_seats[s]&&occupants[s]==NONE){units[i].object.parent_object_index=v;units[i].unit.parent_seat_index=s;units[i].unit.animation.state=_unit_state_entering_seat;}}
++static boolean unit_try_and_exit_seat(long i){exit_calls++;if(exit_ok)units[i].unit.animation.state=_unit_state_exiting_seat;return exit_ok;}
++
++#define COMPANION_OBSTACLE_REACH 2.f
++struct path_input {int unused;};struct path_result {int unused;};
++static int companion_path_state,path_calls,native_start_calls;
++static real path_obstacle_search_reach;
++static boolean route_found=TRUE;
++static real_point3d route_start,route_destination;
++static long companion_navigation_start(long i,real_point3d *start){native_start_calls++;*start=origins[i];return 0;}
++static real companion_navigation_radius(long i){return 0.2f;}
++static void path_input_new(struct path_input *p,real radius,boolean flying,long i){}
++static void path_input_set_start(struct path_input *p,real_point3d const *start,long surface){route_start=*start;}
++static void path_state_new(struct path_input *i,int *state,void *unused){}
++static void path_state_destination(int *state,real_point3d const *point,long surface,real tolerance){route_destination=*point;}
++static boolean path_state_find(int *state){path_calls++;return route_found;}
++static boolean path_state_build_path(int *state,struct path_result *result){return route_found;}
++#include "under_test.inc"
++int main(int argc,char **argv){
++ const char *case_name=argv[1];short selected=99;real_point3d entrance;
++ companion_body.ride_vehicle=NONE;companion_body.ride_seat=NONE;units[0].object.parent_object_index=NONE;units[2].object.parent_object_index=1;units[0].object.forward.i=1;body_definition.biped.collision_radius=0.2f;
++ units[1].object.type=1;units[1].object.up.k=1;fake_definition.unit.seats.count=4;fake_definition.unit.seats.address=seats;
++ seats[0].flags=FLAG(_unit_seat_driver_bit);seats[2].flags=seats[3].flags=FLAG(_unit_seat_gunner_bit);
++ CASE("gunner"){CHECK(companion_vehicle_seat(0,1,&selected,&entrance)&&selected==2,"gunner preferred over closer passenger, stable seat-order tie");}
++ CASE("passenger"){free_seats[2]=free_seats[3]=FALSE;CHECK(companion_vehicle_seat(0,1,&selected,&entrance)&&selected==1,"passenger fallback never selects closer driver");}
++ CASE("occupied"){occupants[2]=7;compatible[3]=FALSE;CHECK(companion_vehicle_seat(0,1,&selected,&entrance)&&selected==1,"occupied or incompatible seats cannot be stolen");}
++ CASE("missing-markers"){markers[2]=markers[3]=FALSE;CHECK(companion_vehicle_seat(0,1,&selected,&entrance)&&selected==1,"missing gunner entrance falls back to passenger");}
++ CASE("moving"){units[1].object.translational_velocity.i=0.03f;CHECK(!companion_vehicle_seat(0,1,&selected,&entrance)&&selected==NONE,"moving vehicle cannot start entry");}
++ CASE("overturned"){units[1].object.up.k=0;CHECK(!companion_vehicle_seat(0,1,&selected,&entrance),"overturned entry rejected");}
++ CASE("dead"){units[1].object.damage_flags=1;CHECK(!companion_vehicle_seat(0,1,&selected,&entrance),"dead vehicle rejected");}
++ CASE("invalid"){CHECK(!companion_vehicle_seat(0,NONE,&selected,&entrance)&&selected==NONE,"invalid vehicle rejected");}
++
++ CASE("board"){distances[2]=0.5f;companion_vehicle_update(0,2);CHECK(entry_calls==1&&units[0].object.parent_object_index==1&&units[0].unit.parent_seat_index==2,"native exact gunner seat entered");}
++ CASE("hold-fire-ride"){companion_body.hold_fire=TRUE;distances[2]=0.5f;companion_vehicle_update(0,2);CHECK(entry_calls==1&&companion_body.hold_fire,"hold fire permits riding without changing order");}
++ CASE("occupied-race"){companion_vehicle_update(0,2);occupants[2]=7;now+=15;companion_vehicle_update(0,2);CHECK(!entry_calls&&companion_body.ride_vehicle==NONE,"seat occupied en route cancels entry");}
++ CASE("turn-before-entry"){distances[2]=0.5f;units[0].object.forward.i=-1;companion_vehicle_update(0,2);CHECK(!entry_calls&&companion_body.ride_goal_valid&&companion_body.ride_facing.i>0,"must face entrance before entry");}
++ CASE("wall-before-entry"){distances[2]=0.5f;safe=FALSE;companion_vehicle_update(0,2);CHECK(!entry_calls&&!companion_body.ride_goal_valid,"unsafe ground/wall prevents entry snap");}
++ CASE("moving-during-approach"){companion_vehicle_update(0,2);CHECK(companion_body.ride_goal_valid,"approach selected");units[1].object.translational_velocity.i=0.1f;now+=15;companion_vehicle_update(0,2);CHECK(!entry_calls&&!companion_body.ride_goal_valid,"moving vehicle waits without unchecked walking");}
++ CASE("stay-no-board"){companion_body.order=_companion_order_hold;companion_vehicle_update(0,2);CHECK(!entry_calls&&companion_body.ride_vehicle==NONE,"stay prevents boarding");}
++ CASE("goto-no-board"){companion_body.order=_companion_order_move;companion_vehicle_update(0,2);CHECK(!entry_calls&&companion_body.ride_vehicle==NONE,"go-to prevents boarding");}
++ CASE("chief-exits"){units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;units[2].object.parent_object_index=NONE;companion_vehicle_update(0,2);CHECK(exit_calls==1&&companion_body.ride_exit_pending,"Chief dismount requests safe exit");}
++ CASE("chief-changes"){units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;units[2].object.parent_object_index=0;companion_vehicle_update(0,2);CHECK(exit_calls==1,"vehicle switch leaves old vehicle first");}
++ CASE("unsafe-exit"){units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;units[2].object.parent_object_index=NONE;safe=FALSE;companion_vehicle_update(0,2);CHECK(!exit_calls,"no voluntary exit onto unsafe terrain");}
++ CASE("exit-revalidation"){units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;units[2].object.parent_object_index=NONE;companion_vehicle_update(0,2);safe=FALSE;CHECK(!companion_allow_seat_exit(0)&&units[0].object.parent_object_index==1&&!companion_body.ride_exit_pending,"changed landing denies detach and permits retry");}
++ CASE("exit-finished"){units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;companion_body.ride_exit_pending=TRUE;CHECK(companion_allow_seat_exit(0),"safe animation completion accepted");units[0].object.parent_object_index=NONE;CHECK(companion_finish_seat_exit(0)&&companion_seat_exit_complete(0)&&origins[0].x>0,"verified local exit position replaces native relocation and impulse");}
++ CASE("forced-exit"){safe=FALSE;CHECK(companion_allow_seat_exit(0),"forced native removal unaffected");companion_body.ride_exit_pending=TRUE;units[0].object.damage_flags=1;CHECK(companion_allow_seat_exit(0),"death cannot be trapped by voluntary exit gate");}
++ CASE("approach-budget"){companion_vehicle_update(0,2);companion_body.failures=5;now+=15;companion_vehicle_update(0,2);CHECK(companion_body.ride_vehicle==NONE&&companion_body.ride_retry>now,"five failed routes back off");}
++ CASE("approach-timeout"){companion_vehicle_update(0,2);now+=40*30+1;companion_vehicle_update(0,2);CHECK(companion_body.ride_vehicle==NONE&&companion_body.ride_retry>now,"forty seconds without displacement cancels approach");}
++ CASE("selection-budget"){int probes;companion_vehicle_update(0,2);probes=ground_calls;now++;companion_vehicle_update(0,2);CHECK(ground_calls==probes,"no per-tick seat/ground scan");}
++ CASE("stay-after-exit"){companion_body.order=_companion_order_hold;companion_body.ride_hold_after_exit=TRUE;origins[0].x=3;companion_vehicle_update(0,2);CHECK(companion_body.hold_point.x==3&&!companion_body.ride_hold_after_exit,"stay holds actual safe dismount location");}
++
++ CASE("seated-controls"){units[0].object.parent_object_index=1;CHECK(companion_seated_controls(0,0xffff)==3,"seated controls cannot request driving or other actions");}
++ CASE("entry-controls"){units[0].object.parent_object_index=1;units[0].unit.animation.state=_unit_state_entering_seat;CHECK(!companion_seated_controls(0,0xffff),"entry suppresses every action");}
++ CASE("exit-controls"){units[0].object.parent_object_index=1;units[0].unit.animation.state=_unit_state_exiting_seat;CHECK(!companion_seated_controls(0,0xffff),"exit suppresses every action");}
++ CASE("on-foot-controls"){CHECK(companion_seated_controls(0,0xffff)==0xffff,"foot controls unchanged");}
++
++ CASE("seated-route-start"){real_point3d destination={10,2,0};units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;CHECK(companion_reachable(0,&destination),"seated go-to route validated");CHECK(!native_start_calls&&route_start.x>0&&route_destination.x==10,"route starts at verified exit, preserves captured destination");CHECK(origins[0].x==0&&units[0].object.parent_object_index==1,"validation never teleports or detaches Kevin");}
++ CASE("seated-route-unsafe"){real_point3d destination={10,2,0};units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;safe=FALSE;CHECK(!companion_reachable(0,&destination)&&!path_calls,"unsafe exit rejects seated go-to before route search");}
++ CASE("seated-route-unreachable"){real_point3d destination={10,2,0};units[0].object.parent_object_index=1;units[0].unit.parent_seat_index=2;route_found=FALSE;CHECK(!companion_reachable(0,&destination)&&path_calls==1,"unreachable seated order rejected safely");}
++ CHECK(path_obstacle_search_reach==0.f,"native path obstacle override restored");
++ CASE("airborne-entry"){distances[2]=0.5f;units[0].biped.flags=FLAG(_biped_airborne_bit);companion_vehicle_update(0,2);CHECK(!entry_calls,"no seat snap from an airborne jump");}
++ CASE("busy-entry"){distances[2]=0.5f;busy=TRUE;companion_vehicle_update(0,2);CHECK(!entry_calls,"native busy animation prevents seat entry");}
++ return 0;
++}
 diff --git a/tools/harness/tests/mixer.c b/tools/harness/tests/mixer.c
 index c337600cfe575528cbb6141daa9098e8cdcd9152..993cc4fc59937b4bd6654d05f158cae9dbcd5263 100644
 --- a/tools/harness/tests/mixer.c
@@ -11964,7 +12574,7 @@ index c337600cfe575528cbb6141daa9098e8cdcd9152..993cc4fc59937b4bd6654d05f158cae9
  #define PI 3.14159265358979323846
 diff --git a/tools/harness/tests/test_companion.py b/tools/harness/tests/test_companion.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d33d0c5e6ec7da49050793ae6fd0cf682a7ca2d1
+index 0000000000000000000000000000000000000000..e7af62076e5490a101a77548a66ffd1448279629
 --- /dev/null
 +++ b/tools/harness/tests/test_companion.py
 @@ -0,0 +1,178 @@
@@ -11980,7 +12590,7 @@ index 0000000000000000000000000000000000000000..d33d0c5e6ec7da49050793ae6fd0cf68
 +             'companion_surface_transition', 'companion_spawn_position', 'companion_escape_support', 'companion_escape_footprint', 'companion_validate_corridor', 'companion_safe_direction_check', 'companion_safe_direction', 'companion_advance_waypoint', 'companion_bypass_waypoint', 'companion_refresh_obstacles', 'companion_movement_throttle', 'companion_try_crouch', 'companion_update_crouch', 'companion_jump_support', 'companion_try_jump', 'companion_progress_stalled',
 +             'companion_friendly_cone', 'companion_position_lane', 'companion_retry_ticks', 'companion_follow_goal', 'companion_goal',
 +             'companion_failed_destination', 'companion_remember_failure', 'companion_build_path', 'companion_find_path', 'companion_enemy_get', 'companion_current_target', 'companion_target_eligible', 'companion_target_temporarily_blocked', 'companion_target_weight', 'companion_update_target', 'companion_combat_move_note', 'companion_preferred_distance', 'companion_position_score', 'companion_authored_refresh', 'companion_position_available', 'companion_rank_position', 'companion_exposure', 'companion_tactical_route', 'companion_tactical_goal', 'companion_position_candidates', 'companion_discard_combat_goal', 'companion_combat_goal', 'companion_walk_direction', 'companion_catch_up']
-+CASES = ['bulkhead-next-cliff', 'bulkhead-velocity', 'bulkhead-partial-end', 'bulkhead-shortcut', 'bulkhead-corner-blocked', 'spawn-low-corridor', 'spawn-no-room', 'spawn-no-floor', 'spawn-wall', 'spawn-occupied', 'spawn-ramp', 'spawn-ledge', 'spawn-cache-missing', 'regression-weapon-valid-route', 'regression-escape-throttle', 'regression-failed-combat-goal', 'regression-weapon-minimum', 'regression-investigate-retry', 'crouch-braking-cliff', 'crouch-obstacle', 'crouch-reject', 'crouch-wait-budget', 'crouch-hold', 'crouch-throttle', 'jump-raised-obstacle', 'jump-raised-unsafe', 'recovery-concealment', 'recovery-unavailable', 'recovery-unsafe', 'tactical-orders', 'investigate-envelope', 'regroup-hysteresis', 'native-start-center', 'failed-destination-cache', 'target-switch-route', 'footprint-escape-cache', 'footprint-escape-expiry', 'footprint-escape-bsp', 'footprint-escape-new-gap', 'footprint-escape-live', 'footprint-escape-cliff', 'footprint-escape-blocked', 'footprint-escape-gap', 'footprint-escape-center', 'footprint-escape-dynamic', 'footprint-escape-orders', 'footprint-escape-doorway', 'authored-default-unsafe', 'authored-default-route-failure', 'authored-default-wrong-bsp', 'authored-default-team', 'authored-default-unassociated', 'authored-default-hostile', 'authored-default-dead', 'authored-ramp', 'authored-unsafe', 'authored-claim-race', 'local-friendly-attack-lane', 'authored-threat-position', 'bsp-follow-resumes', 'authored-allied-team', 'authored-enemy-team', 'authored-priority', 'authored-effective-improvement', 'authored-current-hold', 'authored-fallback', 'authored-owned', 'authored-bsp-cache', 'authored-batch-budget', 'combat-no-teleport', 'position-preferred-wide-lane', 'position-partial-route', 'position-partial-unsafe', 'position-cover-grace', 'position-ground-failure', 'position-route-atomic', 'position-moving-chief', 'position-selected-lane-changes', 'position-approach-arrival', 'position-effective-hold', 'position-before-fire', 'position-friendly-lane', 'position-completes', 'position-obstruction-resolves', 'position-retreat-stable', 'position-unreachable-budget', 'position-cache-budget', 'position-weapon-change', 'position-damage-reevaluation', 'pipeline-pursuit', 'pipeline-failed-route', 'chief-leash-boundary', 'combat-near-max', 'combat-preferred-hysteresis', 'combat-reposition-blocked', 'combat-approach', 'combat-leash', 'combat-orders', 'combat-exit', 'combat-approach-safety', 'combat-moving-blocker', 'combat-approach-bounds', 'combat-leash-edge', 'combat-ramp', 'waypoint-bounds', 'waypoint-ramp', 'waypoint-invalid-surface', 'waypoint-gate-budget', 'dynamic-blocker', 'local-refit-budget', 'local-refit-atomic', 'local-refit-partial', 'local-refit-cliff', 'dynamic-blocker-clears', 'narrow-corridor', 'aiming-movement', 'throttle-old-physics', 'padding-prefix', 'waypoint-overshoot', 'waypoint-corner-blocked', 'wall-footprint-live', 'wall-footprint-gap', 'wall-parallel', 'wall-footprint-cliff', 'wall-footprint-obstruction', 'wall-footprint-jump', 'follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
++CASES = ['vehicle-approach-route','vehicle-approach-cliff','vehicle-no-seat-wait','bulkhead-next-cliff', 'bulkhead-velocity', 'bulkhead-partial-end', 'bulkhead-shortcut', 'bulkhead-corner-blocked', 'spawn-low-corridor', 'spawn-no-room', 'spawn-no-floor', 'spawn-wall', 'spawn-occupied', 'spawn-ramp', 'spawn-ledge', 'spawn-cache-missing', 'regression-weapon-valid-route', 'regression-escape-throttle', 'regression-failed-combat-goal', 'regression-weapon-minimum', 'regression-investigate-retry', 'crouch-braking-cliff', 'crouch-obstacle', 'crouch-reject', 'crouch-wait-budget', 'crouch-hold', 'crouch-throttle', 'jump-raised-obstacle', 'jump-raised-unsafe', 'recovery-concealment', 'recovery-unavailable', 'recovery-unsafe', 'tactical-orders', 'investigate-envelope', 'regroup-hysteresis', 'native-start-center', 'failed-destination-cache', 'target-switch-route', 'footprint-escape-cache', 'footprint-escape-expiry', 'footprint-escape-bsp', 'footprint-escape-new-gap', 'footprint-escape-live', 'footprint-escape-cliff', 'footprint-escape-blocked', 'footprint-escape-gap', 'footprint-escape-center', 'footprint-escape-dynamic', 'footprint-escape-orders', 'footprint-escape-doorway', 'authored-default-unsafe', 'authored-default-route-failure', 'authored-default-wrong-bsp', 'authored-default-team', 'authored-default-unassociated', 'authored-default-hostile', 'authored-default-dead', 'authored-ramp', 'authored-unsafe', 'authored-claim-race', 'local-friendly-attack-lane', 'authored-threat-position', 'bsp-follow-resumes', 'authored-allied-team', 'authored-enemy-team', 'authored-priority', 'authored-effective-improvement', 'authored-current-hold', 'authored-fallback', 'authored-owned', 'authored-bsp-cache', 'authored-batch-budget', 'combat-no-teleport', 'position-preferred-wide-lane', 'position-partial-route', 'position-partial-unsafe', 'position-cover-grace', 'position-ground-failure', 'position-route-atomic', 'position-moving-chief', 'position-selected-lane-changes', 'position-approach-arrival', 'position-effective-hold', 'position-before-fire', 'position-friendly-lane', 'position-completes', 'position-obstruction-resolves', 'position-retreat-stable', 'position-unreachable-budget', 'position-cache-budget', 'position-weapon-change', 'position-damage-reevaluation', 'pipeline-pursuit', 'pipeline-failed-route', 'chief-leash-boundary', 'combat-near-max', 'combat-preferred-hysteresis', 'combat-reposition-blocked', 'combat-approach', 'combat-leash', 'combat-orders', 'combat-exit', 'combat-approach-safety', 'combat-moving-blocker', 'combat-approach-bounds', 'combat-leash-edge', 'combat-ramp', 'waypoint-bounds', 'waypoint-ramp', 'waypoint-invalid-surface', 'waypoint-gate-budget', 'dynamic-blocker', 'local-refit-budget', 'local-refit-atomic', 'local-refit-partial', 'local-refit-cliff', 'dynamic-blocker-clears', 'narrow-corridor', 'aiming-movement', 'throttle-old-physics', 'padding-prefix', 'waypoint-overshoot', 'waypoint-corner-blocked', 'wall-footprint-live', 'wall-footprint-gap', 'wall-parallel', 'wall-footprint-cliff', 'wall-footprint-obstruction', 'wall-footprint-jump', 'follow', 'running-follow', 'moving-chief-stuck', 'orders', 'failed-path', 'retry-budget', 'alternative', 'partial-path', 'progress',
 +         'cliff', 'slope', 'clearance', 'jump', 'jump-outcome', 'unsafe-jump', 'teleport', 'safety-performance', 'cache-expiry', 'cache-boundary', 'cache-turn',
 +         'cache-invalidation', 'cache-speed', 'cache-obstruction', 'cliff-speeds', 'cache-slope', 'cache-jump', 'cache-actual-position', 'floor-contact', 'doorway-transition', 'doorway-reject', 'doorway-follow', 'missing-support-cache', 'missing-nav-cache', 'missing-cache-cliff', 'terrain-recovery-wake', 'terrain-recovery-cliff']
 +
@@ -12148,10 +12758,10 @@ index 0000000000000000000000000000000000000000..d33d0c5e6ec7da49050793ae6fd0cf68
 +    assert 'SET_FLAG(flags, _unit_control_jump_bit, game_time_get() == companion_body.jump_started)' in control
 diff --git a/tools/harness/tests/test_companion_combat.py b/tools/harness/tests/test_companion_combat.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..fc15c2209be7301e2c1f4d84ea208d6078b48a0a
+index 0000000000000000000000000000000000000000..8ce81854f06b29ef962872d5614256b7f8b154d3
 --- /dev/null
 +++ b/tools/harness/tests/test_companion_combat.py
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,124 @@
 +"""Native targeting, fire safety, command parsing and persistent orders."""
 +import sys
 +import re
@@ -12160,12 +12770,12 @@ index 0000000000000000000000000000000000000000..fc15c2209be7301e2c1f4d84ea208d60
 +sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 +from harness import build, read, function, structure, enum_with, mutated, run, CHECK_FAILED
 +FUNCTIONS = ['companion_enemy_team','companion_unit_alive','companion_enemy_get','companion_current_target',
-+             'companion_combat_ticks','companion_update_combat_profile','companion_engagement_range',
-+             'companion_observe','companion_insert_enemy','companion_recent_threat','companion_vision_distances','companion_refresh_enemy','companion_enemy_in_view','companion_firing_origin','companion_aim_solution','companion_friendly_cone',
-+             'companion_position_lane','companion_safe_shot','companion_target_eligible','companion_target_temporarily_blocked','companion_target_in_firing_range','companion_target_weight','companion_update_target','companion_in_combat','companion_blocked_target','companion_fire_requested','companion_reload_needed','companion_look_around',
++             'companion_combat_ticks','companion_weapon_owner','companion_update_combat_profile','companion_engagement_range',
++             'companion_observe','companion_insert_enemy','companion_recent_threat','companion_vision_distances','companion_refresh_enemy','companion_enemy_in_view','companion_muzzle','companion_firing_origin','companion_actual_aim','companion_aim_solution','companion_friendly_cone',
++             'companion_position_lane','companion_safe_shot_ray','companion_safe_shot','companion_target_eligible','companion_target_temporarily_blocked','companion_target_in_firing_range','companion_target_weight','companion_update_target','companion_in_combat','companion_blocked_target','companion_fire_requested','companion_reload_needed','companion_look_around',
 +             'companion_set_order','companion_message_value','companion_message_number',
 +             'companion_context_current','companion_capture_context','companion_apply_command','companion_reset_body', 'companion_note_projectile']
-+CASES = ['memory-capacity', 'rejection-reasons', 'memory-freeze', 'memory-unseen', 'memory-visible-priority', 'friendly-between-aims', 'native-moving-pattern', 'native-ai-trigger-rate', 'projectile-observer', 'native-burst-alignment', 'native-close-alignment', 'native-unaligned-safety', 'native-burst-friendly-crossing', 'stateful-semi-cadence', 'burst-tracking-fraction', 'native-engine-aim-lag', 'no-chief-target-leash', 'native-range-weighting', 'native-vision-parity', 'a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'combat-measure-blocked', 'marine-transition-vision', 'blocked-retarget', 'native-profile-override', 'minimum-range', 'blocked-target-held-for-reposition', 'out-of-range-no-obstruction', 'near-maximum-fire', 'pursuit-outside-range', 'unsupported', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'aim-failure', 'head-visibility', 'marine-vision', 'recent-attacker', 'dead-occluded', 'muzzle-safety', 'actual-ray-safety', 'friendly-entry', 'friendly-intended-and-actual', 'reload-and-heat', 'weapon-change', 'semi-bursts', 'fire-and-orders', 'sensing-budget', 'combat-measure', 'combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
++CASES = ['go-aim-seated-order','stay-seated-order','mounted-owner','mounted-firing','mounted-hold-fire','mounted-friendly','mounted-misaligned','mounted-multiple-muzzles','mounted-too-many-muzzles','mounted-unsupported','mounted-weapon-change','passenger-owner','memory-capacity', 'rejection-reasons', 'memory-freeze', 'memory-unseen', 'memory-visible-priority', 'friendly-between-aims', 'native-moving-pattern', 'native-ai-trigger-rate', 'projectile-observer', 'native-burst-alignment', 'native-close-alignment', 'native-unaligned-safety', 'native-burst-friendly-crossing', 'stateful-semi-cadence', 'burst-tracking-fraction', 'native-engine-aim-lag', 'no-chief-target-leash', 'native-range-weighting', 'native-vision-parity', 'a10-linear-gravity', 'unmatched-firing-profile', 'unspecified-burst-geometry', 'missing-origin-diagnostic', 'combat-measure-blocked', 'marine-transition-vision', 'blocked-retarget', 'native-profile-override', 'minimum-range', 'blocked-target-held-for-reposition', 'out-of-range-no-obstruction', 'near-maximum-fire', 'pursuit-outside-range', 'unsupported', 'stationary-solution', 'moving-projectile', 'vehicle-lead', 'aim-failure', 'head-visibility', 'marine-vision', 'recent-attacker', 'dead-occluded', 'muzzle-safety', 'actual-ray-safety', 'friendly-entry', 'friendly-intended-and-actual', 'reload-and-heat', 'weapon-change', 'semi-bursts', 'fire-and-orders', 'sensing-budget', 'combat-measure', 'combat-state','profiles','acquire','occluded-elite','retain','switch','visibility-grace','friendly-fire',
 +         'trigger','captured-aim','orders','reject-location','context','parser','reset']
 +
 +
@@ -12258,8 +12868,9 @@ index 0000000000000000000000000000000000000000..fc15c2209be7301e2c1f4d84ea208d60
 +    assert 'companion_refresh_enemy(unit_index, target)' in control
 +    assert 'companion_aim_solution(unit_index, target, &shot)' in control
 +    assert 'if (!solution && target' not in control
-+    assert 'solution && companion_fire_requested(unit_index, target, &shot)' in control
-+    assert 'if (solution)' in control and 'solution && companion_fire_requested' in control
++    assert 'fire_request = solution && companion_body.ride_vehicle == NONE' in control
++    assert 'companion_fire_requested(unit_index, target, &shot)' in control
++    assert 'if (solution)' in control
 +    assert 'companion_reload_needed(held_weapon_index)' in control
 +    assert 'companion_movement_throttle(unit_index, &walk, &facing, &control.throttle)' in control
 +
@@ -12509,6 +13120,47 @@ index 0000000000000000000000000000000000000000..8a189d71057e4d8d8a3f2a34906db450
 +def test_failed_spawn_never_deletes_existing_body():
 +    status, output = run(build('companion_spawn', generated('delete-first')), 'space-failure')
 +    assert status == 1, output
+diff --git a/tools/harness/tests/test_companion_vehicle.py b/tools/harness/tests/test_companion_vehicle.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d51cb80562c413bae86e186e1a060b60fe670bec
+--- /dev/null
++++ b/tools/harness/tests/test_companion_vehicle.py
+@@ -0,0 +1,35 @@
++"""Native companion seat selection: identity, compatibility, occupancy and role."""
++import sys
++from pathlib import Path
++import pytest
++sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
++from harness import build, read, function, run, mutated
++
++def generated(fault=False):
++    source=read('port/linux/game/companion.c')
++    code='\n'.join(function(source,name) for name in ['companion_vehicle_seat','companion_vehicle_exit_point','companion_allow_seat_exit','companion_finish_seat_exit','companion_seat_exit_complete','companion_vehicle_cancel','companion_reachable','companion_vehicle_note','companion_vehicle_update','companion_seated_controls'])
++    if fault:
++        code=mutated(code, '(gunner && !best_gunner)', '(FALSE)')
++    return (('under_test.inc',code),)
++
++@pytest.mark.parametrize('case',['gunner','passenger','occupied','missing-markers','moving','overturned','dead','invalid','board','hold-fire-ride','occupied-race','turn-before-entry','wall-before-entry','moving-during-approach','stay-no-board','goto-no-board','chief-exits','chief-changes','unsafe-exit','exit-revalidation','exit-finished','forced-exit','approach-budget','approach-timeout','selection-budget','stay-after-exit','seated-controls','entry-controls','exit-controls','on-foot-controls','seated-route-start','seated-route-unsafe','seated-route-unreachable','airborne-entry','busy-entry'])
++def test_selection(case):
++    status,output=run(build('companion_vehicle',generated()),case)
++    assert status==0,output
++
++def test_role_priority_negative_control():
++    status,output=run(build('companion_vehicle',generated(True)),'gunner')
++    assert status==1,output
++
++
++def test_native_exit_hook_scope():
++    source=read('source/units/units.c')
++    direct=function(source,'unit_exit_seat_end')
++    animation=function(source,'unit_update_animation')
++    assert 'companion_allow_seat_exit' not in direct
++    gate=animation.index('if (!companion_allow_seat_exit(unit_index))')
++    detach=animation.index('unit_exit_seat_end(unit_index);',gate)
++    impulse=animation.index('add_vectors3d(',detach)
++    assert gate < detach < animation.index('companion_seat_exit_complete',detach) < impulse
++    finish=function(read('source/units/bipeds.c'),'biped_exit_seat_end')
++    assert finish.index('companion_finish_seat_exit') < finish.index('biped_fix_position')
 diff --git a/tools/port_settings.py b/tools/port_settings.py
 index 6e8028f85df9191d81ad20af6fcffc268d710e5a..9d4e079f6cfadd8a65087bd384f5123a599bdb48 100644
 --- a/tools/port_settings.py
